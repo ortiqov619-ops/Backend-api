@@ -61,11 +61,13 @@ async function requirePermission(request: FastifyRequest, reply: FastifyReply, p
 }
 async function audit(actor: Claims | null, action: string, entityType: string, entityId: string | null, reason: string | null, after: Json | null, request: FastifyRequest) {
   const actorName = actor ? (await db.query<{ full_name: string }>('SELECT full_name FROM users WHERE id = $1', [actor.sub])).rows[0]?.full_name ?? 'Administrator' : 'Tizim';
+  const auditLogId = newId();
   await db.query(
     `INSERT INTO audit_logs (action, entity_type, entity_id, actor_id, actor_name, actor_roles, ip_address, user_agent, after_data, reason, request_id)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
-    [action, entityType, entityId, actor?.sub ?? null, actorName, actor?.roles ?? [], request.ip ?? null, request.headers['user-agent'] ?? null, after, reason, newId()],
+    [action, entityType, entityId, actor?.sub ?? null, actorName, actor?.roles ?? [], request.ip ?? null, request.headers['user-agent'] ?? null, after, reason, auditLogId],
   );
+  return auditLogId;
 }
 
 function mapRegion(row: QueryResultRow) {
@@ -200,6 +202,20 @@ app.get('/v3/words', async (request) => {
   const total = count.rows[0].total; return { items: words.rows.map(mapWord), meta: { page: current, pageSize: size, total, totalPages: Math.ceil(total / size) } };
 });
 app.get('/v3/words/:id', async (request, reply) => { const result = await db.query('SELECT * FROM words WHERE id=$1 AND status=\'published\'', [(request.params as Json).id]); if (!result.rows[0]) return apiError(reply, 404, 'not_found', 'So‘z topilmadi.'); return mapWord(result.rows[0]); });
+
+/** Adminning bevosita lug‘atga kiritishi: foydalanuvchi taklifidan farqli
+ * ravishda nashr etilgan yozuv darhol yaratiladi va auditga tushadi. */
+app.post('/v3/admin/words', async (request, reply) => {
+  const claims = await requirePermission(request, reply, 'words:write'); if (!claims) return;
+  const body = asObject(request.body); const word = asString(body.word); const meaning = asString(body.meaning); const reason = asString(body.changeReason);
+  if (!word || !meaning || !reason) return apiError(reply, 422, 'validation_failed', 'So‘z, ma’no va kiritish sababi majburiy.');
+  const exists = await db.query(`SELECT id FROM words WHERE status <> 'archived' AND phonetic_key=$1 LIMIT 1`, [phoneticKey(word)]);
+  if (exists.rows[0]) return apiError(reply, 409, 'conflict', 'Shunga o‘xshash so‘z lug‘atda allaqachon bor.');
+  const created = await db.query(`INSERT INTO words (word,literary_form,meaning,example,category,phonetic_key,status,region_id,district_id,dialect_id)
+    VALUES ($1,$2,$3,$4,$5,$6,'published',$7,$8,$9) RETURNING *`, [word, body.literaryForm ?? null, meaning, body.example ?? null, body.category ?? null, phoneticKey(word), body.regionId ?? null, body.districtId ?? null, body.dialectId ?? null]);
+  const auditLogId = await audit(claims, 'word.create', 'word', created.rows[0].id, reason, { word, meaning, source: 'admin_direct' }, request);
+  return reply.status(201).send({ word: mapWord(created.rows[0]), auditLogId });
+});
 
 app.post('/v3/contributions/words', async (request, reply) => {
   const body = asObject(request.body); const payload = asObject(body.payload); const location = asObject(body.location); const device = asObject(body.device); const key = asString(body.idempotencyKey);
