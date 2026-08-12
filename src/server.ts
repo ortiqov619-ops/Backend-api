@@ -15,8 +15,12 @@ assertProductionConfig();
 const db = new Pool({ connectionString: config.databaseUrl, ssl: process.env.DATABASE_SSL === 'true' ? { rejectUnauthorized: false } : undefined });
 const app = Fastify({ logger: true, bodyLimit: 10 * 1024 * 1024 });
 
-await app.register(cors, { origin: (origin, callback) => callback(null, !origin || config.corsOrigins.includes(origin)) });
-await app.register(multipart, { limits: { fileSize: 8 * 1024 * 1024, files: 1 } });
+// `tsx` executes this entrypoint as CommonJS in the production Docker image.
+// Keep plugin setup in a promise so the file has no top-level `await`.
+const pluginsReady = Promise.all([
+  app.register(cors, { origin: (origin, callback) => callback(null, !origin || config.corsOrigins.includes(origin)) }),
+  app.register(multipart, { limits: { fileSize: 8 * 1024 * 1024, files: 1 } }),
+]);
 
 type Json = Record<string, unknown>;
 type Claims = { sub: string; roles: string[]; permissions: string[] };
@@ -317,4 +321,12 @@ app.get('/v3/audio/:id', async (request, reply) => { const row=(await db.query('
 
 app.setErrorHandler((error, _request, reply) => { app.log.error(error); if ((error as { code?: string }).code === 'FST_REQ_FILE_TOO_LARGE') return apiError(reply,413,'payload_too_large','Audio 8 MB dan oshmasligi kerak.'); return apiError(reply,500,'internal_error','Serverda kutilmagan xatolik yuz berdi.'); });
 
-await app.listen({ port: config.port, host: '0.0.0.0' });
+async function startServer() {
+  await pluginsReady;
+  await app.listen({ port: config.port, host: '0.0.0.0' });
+}
+
+void startServer().catch((error: unknown) => {
+  app.log.error(error, 'Server ishga tushmadi');
+  process.exitCode = 1;
+});
