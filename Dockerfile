@@ -11,4 +11,7 @@ COPY db/migrations db/migrations
 
 ENV NODE_ENV=production
 EXPOSE 3000
-CMD ["npm", "run", "start"]
+# Migrations and the owner-admin account setup are idempotent. Running them
+# before the API starts keeps a fresh Render Postgres database deployable
+# without a paid interactive shell.
+CMD ["/bin/sh", "-c", "npm run migrate && npm run seed:admin && npm run start"]

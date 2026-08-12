@@ -20,6 +20,7 @@ const db = new Pool({
   ssl: process.env.DATABASE_SSL === 'true' ? { rejectUnauthorized: false } : undefined,
 });
 
+async function runMigrations() {
 try {
   await db.query(`
     CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -44,3 +45,9 @@ try {
 } finally {
   await db.end();
 }
+}
+
+void runMigrations().catch((error: unknown) => {
+  console.error(error);
+  process.exitCode = 1;
+});
