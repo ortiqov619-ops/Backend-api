@@ -1,0 +1,30 @@
+{
+  "name": "xorazm-shevalari-backend-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Xorazm Shevalari uchun Fastify va PostgreSQL backend API.",
+  "workspaces": ["shared"],
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "start": "tsx src/server.ts",
+    "migrate": "tsx src/migrate.ts",
+    "seed:admin": "tsx src/seed-admin.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@fastify/cors": "^11.3.0",
+    "@fastify/multipart": "^10.1.0",
+    "@xorazm/shared": "file:./shared",
+    "bcryptjs": "^3.0.3",
+    "dotenv": "^16.4.7",
+    "fastify": "^5.11.3",
+    "jose": "^6.2.8",
+    "pg": "^8.23.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "@types/pg": "^8.21.0",
+    "tsx": "^4.23.12",
+    "typescript": "^5.8.3"
+  }
+}

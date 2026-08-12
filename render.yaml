@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: xorazm-shevalari-backend-api
+    runtime: docker
+    healthCheckPath: /health
+    disk:
+      name: xorazm-audio
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_SSL
+        value: "true"
+      - key: AUDIO_STORAGE_MODE
+        value: local
+      - key: AUDIO_UPLOAD_DIR
+        value: /var/data/uploads
+      - key: PORT
+        value: "3000"
