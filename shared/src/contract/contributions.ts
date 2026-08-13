@@ -67,7 +67,11 @@ export interface ContributionRequest extends Auditable {
 /** POST /contributions/words */
 export interface CreateWordContributionRequest {
   payload: ContributionPayload;
-  location: LocationSample;
+  /** GPS namunasi mavjud bo'lsa yuboriladi. Safardagi Xorazmlik uchun bo'sh bo'lishi mumkin. */
+  location?: LocationSample | null;
+  /** Foydalanuvchining Xorazm bilan doimiy aloqasi haqidagi deklaratsiyasi.
+   * Bunday hissa doimo moderator tekshiruviga tushadi. */
+  heritageDeclaration?: boolean;
   device: DeviceContext;
   /** Client tomonda hisoblangan dastlabki filtr — server qayta hisoblaydi. */
   clientValidation?: ValidationResult;
@@ -93,7 +97,8 @@ export interface CreateAudioContributionMeta {
   expectedText: string;
   durationMs: number;
   mimeType: string;
-  location: LocationSample;
+  location?: LocationSample | null;
+  heritageDeclaration?: boolean;
   device: DeviceContext;
   idempotencyKey: string;
 }

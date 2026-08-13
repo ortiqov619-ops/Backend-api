@@ -84,6 +84,18 @@ function mapWord(row: QueryResultRow) {
 }
 async function activeFences() { const result = await db.query('SELECT * FROM geofences WHERE is_active = true'); return result.rows.map(mapFence); }
 
+/** Mobil GPS uchun juda qat'iy boshlang'ich siyosat amalda hissa oqimini
+ * to'xtatib qo'yar edi. Bu yerda pastroq aniqlik qabul qilinadi, lekin u
+ * avtomatik ravishda moderator tekshiruviga belgilab yuboriladi. */
+function practicalMobileGate(sample: Json, geofences: Awaited<ReturnType<typeof activeFences>>) {
+  const source = evaluateLocationGate({ sample: sample as never, permission: 'granted', geofences });
+  if (source.status !== 'low_accuracy') return source;
+  const accuracy = Number(sample.accuracy);
+  if (!Number.isFinite(accuracy) || accuracy > 1_500) return source;
+  const relaxedFences = geofences.map((fence) => ({ ...fence, policy: { ...fence.policy, maxAccuracyM: 1_500, boundaryReviewBufferM: 2_000 } }));
+  return evaluateLocationGate({ sample: sample as never, permission: 'granted', geofences: relaxedFences });
+}
+
 async function mapRequest(row: QueryResultRow) {
   const audio = row.audio_id ? {
     id: row.audio_id, contributionRequestId: row.id, storageKey: row.storage_key, mimeType: row.mime_type, durationMs: row.duration_ms,
@@ -221,13 +233,18 @@ app.post('/v3/contributions/words', async (request, reply) => {
   const body = asObject(request.body); const payload = asObject(body.payload); const location = asObject(body.location); const device = asObject(body.device); const key = asString(body.idempotencyKey);
   if (!asString(payload.word) || !asString(payload.meaning) || !key) return apiError(reply, 422, 'validation_failed', 'So‘z, ma’no va idempotency kaliti majburiy.');
   const existing = await db.query(`${requestSql} WHERE cr.idempotency_key=$1`, [key]); if (existing.rows[0]) return { request: await mapRequest(existing.rows[0]), userMessage: 'Avvalgi so‘rov qaytarildi.' };
-  const geofences = await activeFences(); const gate = evaluateLocationGate({ sample: location as never, permission: 'granted', geofences });
-  if (!gate.allowed) return apiError(reply, 422, gate.status === 'outside' ? 'location_outside_geofence' : gate.status === 'low_accuracy' ? 'location_low_accuracy' : 'location_stale', gate.message);
+  const geofences = await activeFences(); const heritageDeclaration = bool(body.heritageDeclaration);
+  const hasLocation = Number.isFinite(Number(location.latitude)) && Number.isFinite(Number(location.longitude));
+  const gate = hasLocation ? practicalMobileGate(location, geofences) : evaluateLocationGate({ sample: null, permission: 'undetermined', geofences });
+  // Safardagi Xorazmlikning deklaratsiyasi GPS geofence o'rnini bosmaydi:
+  // u faqat hissa moderatorning majburiy navbatiga tushishiga ruxsat beradi.
+  const allowedByHeritage = heritageDeclaration && !gate.allowed;
+  if (!gate.allowed && !allowedByHeritage) return apiError(reply, 422, gate.status === 'outside' ? 'location_outside_geofence' : gate.status === 'low_accuracy' ? 'location_low_accuracy' : 'location_stale', gate.message);
   const duplicates = await db.query('SELECT id, word, phonetic_key FROM words WHERE status <> \'archived\'');
-  const validation = validateContributionText({ payload: payload as never, locationGate: gate, duplicateCandidates: duplicates.rows.map((row) => ({ id: row.id, word: row.word, phoneticKey: row.phonetic_key })), origin: 'server' });
+  const validation = validateContributionText({ payload: payload as never, locationGate: allowedByHeritage ? null : gate, duplicateCandidates: duplicates.rows.map((row) => ({ id: row.id, word: row.word, phoneticKey: row.phonetic_key })), origin: 'server' });
   if (validation.verdict === 'rejected') return apiError(reply, 422, 'validation_failed', 'So‘z avtomatik tekshiruvdan o‘tmadi.');
   const created = await db.query(`INSERT INTO contribution_requests (payload, device, idempotency_key, latitude, longitude, location_accuracy_m, location_checked_at, submission_location_status, matched_geofence_id, geofence_version, distance_to_boundary_m, is_location_mocked, validation_verdict, validation_score, requires_human_review)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id`, [payload, device, key, location.latitude, location.longitude, location.accuracy, location.capturedAt, gate.status, gate.matchedGeofenceId ?? null, geofences.find((f) => f.id === gate.matchedGeofenceId)?.version ?? null, gate.distanceToBoundaryM ?? null, location.isMocked ?? null, validation.verdict, validation.score, validation.verdict !== 'accepted_for_review' || gate.requiresReview]);
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id`, [payload, { ...device, heritageDeclaration }, key, hasLocation ? location.latitude : null, hasLocation ? location.longitude : null, hasLocation ? location.accuracy : null, hasLocation ? location.capturedAt : null, allowedByHeritage ? 'not_provided' : gate.status, gate.matchedGeofenceId ?? null, geofences.find((f) => f.id === gate.matchedGeofenceId)?.version ?? null, gate.distanceToBoundaryM ?? null, location.isMocked ?? null, validation.verdict, validation.score, true]);
   const requestId = created.rows[0].id;
   await db.query('INSERT INTO validation_results (contribution_request_id, subject, verdict, score, confidence, reasons, engine_kind, engine_name, engine_version, origin, geofence_version) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)', [requestId, validation.subject, validation.verdict, validation.score, validation.confidence, validation.reasons, validation.engine.kind, validation.engine.name, validation.engine.version, validation.origin, geofences.find((f) => f.id === gate.matchedGeofenceId)?.version ?? null]);
   const record = await db.query(`${requestSql} WHERE cr.id=$1`, [requestId]); return { request: await mapRequest(record.rows[0]), userMessage: 'So‘zingiz moderatorlar tekshiruviga yuborildi.' };
@@ -238,7 +255,7 @@ app.post('/v3/audio/transcriptions', async (request, reply) => {
   const buffer = await file.toBuffer();
   const locationText = multipartFieldValue(file.fields.location);
   let location: Json = {}; try { location = JSON.parse(String(locationText ?? '{}')) as Json; } catch { return apiError(reply, 422, 'validation_failed', 'Lokatsiya formati noto‘g‘ri.'); }
-  const gate = evaluateLocationGate({ sample: location as never, permission: 'granted', geofences: await activeFences() });
+  const gate = practicalMobileGate(location, await activeFences());
   if (!gate.allowed) return apiError(reply, 422, 'location_outside_geofence', gate.message);
   try { const result = await transcribe(buffer, file.filename, file.mimetype); return result; } catch (error) { return apiError(reply, 503, 'provider_unavailable', error instanceof Error ? error.message : 'STT ishlamayapti.'); }
 });
@@ -248,7 +265,7 @@ app.post('/v3/contributions/audio', async (request, reply) => {
   const buffer = await file.toBuffer();
   const metaText = multipartFieldValue(file.fields.meta); let meta: Json = {};
   try { meta = JSON.parse(String(metaText ?? '{}')) as Json; } catch { return apiError(reply, 422, 'validation_failed', 'Audio metama’lumoti noto‘g‘ri.'); }
-  const gate = evaluateLocationGate({ sample: asObject(meta.location) as never, permission: 'granted', geofences: await activeFences() });
+  const gate = practicalMobileGate(asObject(meta.location), await activeFences());
   if (!gate.allowed) return apiError(reply, 422, 'location_outside_geofence', gate.message);
   const stored = await storeAudio(buffer, file.filename, file.mimetype); const checksum = createHash('sha256').update(buffer).digest('hex');
   const created = await db.query(`INSERT INTO audio_submissions (contribution_request_id, word_id, storage_bucket, storage_key, mime_type, duration_ms, size_bytes, checksum_sha256, expected_text, moderation_status)
