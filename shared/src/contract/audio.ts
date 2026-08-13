@@ -87,7 +87,7 @@ export interface AudioSubmission extends Auditable {
 
 export const AUDIO_LIMITS = {
   minDurationMs: 700,
-  maxDurationMs: 30_000,
+  maxDurationMs: 40_000,
   maxSizeBytes: 8 * 1024 * 1024,
   allowedMimeTypes: ['audio/m4a', 'audio/mp4', 'audio/aac', 'audio/wav', 'audio/webm'] as const,
 } as const;

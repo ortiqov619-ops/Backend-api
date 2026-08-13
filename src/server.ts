@@ -200,6 +200,37 @@ app.get('/v3/regions', async (request) => {
   return response;
 });
 
+/** Hudud katalogi loyiha egasi nazoratida. Boshlanishida faqat Xorazm
+ * ochiq; yangi viloyatlar avval yopiq yaratiladi va admin alohida yoqadi. */
+app.post('/v3/admin/regions', async (request, reply) => {
+  const claims = await requirePermission(request, reply, 'regions:write'); if (!claims) return;
+  const body = asObject(request.body); const nameUz = asString(body.nameUz); const code = asString(body.code).toLowerCase(); const reason = asString(body.changeReason);
+  const level = asString(body.level) || 'region';
+  if (!nameUz || !code || !reason) return apiError(reply, 422, 'validation_failed', 'Hudud nomi, kodi va o‘zgarish sababi majburiy.');
+  if (!['region','district','village','neighborhood'].includes(level)) return apiError(reply, 422, 'validation_failed', 'Hudud darajasi noto‘g‘ri.');
+  const parentId = body.parentId ?? (level === 'region' ? '00000000-0000-4000-8000-000000000000' : null);
+  try {
+    const created = await db.query(`INSERT INTO regions (code,name_uz,parent_id,level,is_contribution_allowed,sort_order,created_by,updated_by)
+      VALUES ($1,$2,$3,$4,false,COALESCE((SELECT max(sort_order)+1 FROM regions),1),$5,$5) RETURNING *`, [code,nameUz,parentId,level,claims.sub]);
+    await audit(claims, 'region.update', 'region', created.rows[0].id, reason, { action:'create', code, nameUz, level, isContributionAllowed:false }, request);
+    return reply.status(201).send({ region: mapRegion(created.rows[0]) });
+  } catch (error) {
+    if ((error as { code?: string }).code === '23505') return apiError(reply, 409, 'conflict', 'Bunday hudud kodi allaqachon mavjud.');
+    throw error;
+  }
+});
+
+app.patch('/v3/admin/regions/:id', async (request, reply) => {
+  const claims = await requirePermission(request, reply, 'regions:write'); if (!claims) return;
+  const id = asString((request.params as Json).id); const body = asObject(request.body); const reason = asString(body.changeReason);
+  if (!reason || typeof body.isContributionAllowed !== 'boolean') return apiError(reply, 422, 'validation_failed', 'Hissa holati va o‘zgarish sababi majburiy.');
+  const current = await db.query('SELECT * FROM regions WHERE id=$1', [id]); if (!current.rows[0]) return apiError(reply, 404, 'not_found', 'Hudud topilmadi.');
+  if (current.rows[0].level === 'republic') return apiError(reply, 422, 'validation_failed', 'Respublika darajasi hissa hududi sifatida yoqilmaydi.');
+  const updated = await db.query('UPDATE regions SET is_contribution_allowed=$2,updated_by=$3 WHERE id=$1 RETURNING *', [id,body.isContributionAllowed,claims.sub]);
+  await audit(claims, 'region.update', 'region', id, reason, { isContributionAllowed:body.isContributionAllowed }, request);
+  return { region: mapRegion(updated.rows[0]) };
+});
+
 app.get('/v3/words', async (request) => {
   const query = request.query as Json; const requester = await claimsFor(request); const params: unknown[] = []; const where: string[] = [];
   if (!requester || !query.status) where.push(`status = 'published'`); else { params.push(query.status); where.push(`status = $${params.length}`); }
@@ -235,28 +266,26 @@ app.post('/v3/contributions/words', async (request, reply) => {
   const existing = await db.query(`${requestSql} WHERE cr.idempotency_key=$1`, [key]); if (existing.rows[0]) return { request: await mapRequest(existing.rows[0]), userMessage: 'Avvalgi so‘rov qaytarildi.' };
   const geofences = await activeFences(); const heritageDeclaration = bool(body.heritageDeclaration);
   const hasLocation = Number.isFinite(Number(location.latitude)) && Number.isFinite(Number(location.longitude));
-  const gate = hasLocation ? practicalMobileGate(location, geofences) : evaluateLocationGate({ sample: null, permission: 'undetermined', geofences });
-  // Safardagi Xorazmlikning deklaratsiyasi GPS geofence o'rnini bosmaydi:
-  // u faqat hissa moderatorning majburiy navbatiga tushishiga ruxsat beradi.
-  const allowedByHeritage = heritageDeclaration && !gate.allowed;
-  if (!gate.allowed && !allowedByHeritage) return apiError(reply, 422, gate.status === 'outside' ? 'location_outside_geofence' : gate.status === 'low_accuracy' ? 'location_low_accuracy' : 'location_stale', gate.message);
+  const gate = hasLocation ? practicalMobileGate(location, geofences) : null;
+  // GPS hissa yuborish sharti emas. Hudud foydalanuvchi tanlovi va admin
+  // moderatsiyasi bilan belgilanadi; mavjud koordinata faqat ixtiyoriy auditdir.
+  const requestedRegionId = asString(payload.regionId) || '00000000-0000-4000-8000-000000000001';
+  const allowedRegion = await db.query('SELECT id FROM regions WHERE id=$1 AND is_contribution_allowed=true', [requestedRegionId]);
+  if (!allowedRegion.rows[0]) return apiError(reply, 422, 'validation_failed', 'Tanlangan hudud uchun hissa qabul qilish admin tomonidan yoqilmagan.');
+  payload.regionId = requestedRegionId;
   const duplicates = await db.query('SELECT id, word, phonetic_key FROM words WHERE status <> \'archived\'');
-  const validation = validateContributionText({ payload: payload as never, locationGate: allowedByHeritage ? null : gate, duplicateCandidates: duplicates.rows.map((row) => ({ id: row.id, word: row.word, phoneticKey: row.phonetic_key })), origin: 'server' });
+  const validation = validateContributionText({ payload: payload as never, locationGate: null, duplicateCandidates: duplicates.rows.map((row) => ({ id: row.id, word: row.word, phoneticKey: row.phonetic_key })), origin: 'server', thresholds: { rejectBelow:0, autoQueueAbove:65, minConfidenceForVerdict:0.5 } });
   if (validation.verdict === 'rejected') return apiError(reply, 422, 'validation_failed', 'So‘z avtomatik tekshiruvdan o‘tmadi.');
   const created = await db.query(`INSERT INTO contribution_requests (payload, device, idempotency_key, latitude, longitude, location_accuracy_m, location_checked_at, submission_location_status, matched_geofence_id, geofence_version, distance_to_boundary_m, is_location_mocked, validation_verdict, validation_score, requires_human_review)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id`, [payload, { ...device, heritageDeclaration }, key, hasLocation ? location.latitude : null, hasLocation ? location.longitude : null, hasLocation ? location.accuracy : null, hasLocation ? location.capturedAt : null, allowedByHeritage ? 'not_provided' : gate.status, gate.matchedGeofenceId ?? null, geofences.find((f) => f.id === gate.matchedGeofenceId)?.version ?? null, gate.distanceToBoundaryM ?? null, location.isMocked ?? null, validation.verdict, validation.score, true]);
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id`, [payload, { ...device, heritageDeclaration }, key, hasLocation ? location.latitude : null, hasLocation ? location.longitude : null, hasLocation ? location.accuracy : null, hasLocation ? location.capturedAt : null, hasLocation ? gate?.status ?? 'not_provided' : 'not_provided', gate?.matchedGeofenceId ?? null, geofences.find((f) => f.id === gate?.matchedGeofenceId)?.version ?? null, gate?.distanceToBoundaryM ?? null, hasLocation ? location.isMocked ?? null : null, validation.verdict, validation.score, true]);
   const requestId = created.rows[0].id;
-  await db.query('INSERT INTO validation_results (contribution_request_id, subject, verdict, score, confidence, reasons, engine_kind, engine_name, engine_version, origin, geofence_version) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)', [requestId, validation.subject, validation.verdict, validation.score, validation.confidence, validation.reasons, validation.engine.kind, validation.engine.name, validation.engine.version, validation.origin, geofences.find((f) => f.id === gate.matchedGeofenceId)?.version ?? null]);
+  await db.query('INSERT INTO validation_results (contribution_request_id, subject, verdict, score, confidence, reasons, engine_kind, engine_name, engine_version, origin, geofence_version) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)', [requestId, validation.subject, validation.verdict, validation.score, validation.confidence, validation.reasons, validation.engine.kind, validation.engine.name, validation.engine.version, validation.origin, geofences.find((f) => f.id === gate?.matchedGeofenceId)?.version ?? null]);
   const record = await db.query(`${requestSql} WHERE cr.id=$1`, [requestId]); return { request: await mapRequest(record.rows[0]), userMessage: 'So‘zingiz moderatorlar tekshiruviga yuborildi.' };
 });
 
 app.post('/v3/audio/transcriptions', async (request, reply) => {
   const file = await request.file(); if (!file) return apiError(reply, 422, 'validation_failed', 'Audio fayl topilmadi.');
   const buffer = await file.toBuffer();
-  const locationText = multipartFieldValue(file.fields.location);
-  let location: Json = {}; try { location = JSON.parse(String(locationText ?? '{}')) as Json; } catch { return apiError(reply, 422, 'validation_failed', 'Lokatsiya formati noto‘g‘ri.'); }
-  const gate = practicalMobileGate(location, await activeFences());
-  if (!gate.allowed) return apiError(reply, 422, 'location_outside_geofence', gate.message);
   try { const result = await transcribe(buffer, file.filename, file.mimetype); return result; } catch (error) { return apiError(reply, 503, 'provider_unavailable', error instanceof Error ? error.message : 'STT ishlamayapti.'); }
 });
 
@@ -265,14 +294,8 @@ app.post('/v3/contributions/audio', async (request, reply) => {
   const buffer = await file.toBuffer();
   const metaText = multipartFieldValue(file.fields.meta); let meta: Json = {};
   try { meta = JSON.parse(String(metaText ?? '{}')) as Json; } catch { return apiError(reply, 422, 'validation_failed', 'Audio metama’lumoti noto‘g‘ri.'); }
-  const heritageDeclaration = bool(meta.heritageDeclaration);
-  const audioLocation = asObject(meta.location);
-  const hasLocation = Number.isFinite(Number(audioLocation.latitude)) && Number.isFinite(Number(audioLocation.longitude));
-  const geofences = await activeFences();
-  const gate = hasLocation ? practicalMobileGate(audioLocation, geofences) : evaluateLocationGate({ sample: null, permission: 'undetermined', geofences });
-  // Safarda bo'lgan Xorazmlik foydalanuvchi ham talaffuz namunasini yubora oladi.
-  // Bunday yozuvlar so'z so'rovi kabi doim moderator tekshiruvidan o'tadi.
-  if (!gate.allowed && !heritageDeclaration) return apiError(reply, 422, 'location_outside_geofence', gate.message);
+  // Audio ham GPS talab qilmaydi; u faqat avval yaratilgan moderatsiya
+  // so‘roviga biriktiriladi va admin tasdiqlamaguncha nashr etilmaydi.
   const stored = await storeAudio(buffer, file.filename, file.mimetype); const checksum = createHash('sha256').update(buffer).digest('hex');
   const created = await db.query(`INSERT INTO audio_submissions (contribution_request_id, word_id, storage_bucket, storage_key, mime_type, duration_ms, size_bytes, checksum_sha256, expected_text, moderation_status)
     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending') RETURNING *`, [meta.contributionRequestId ?? null, meta.wordId ?? null, stored.bucket, stored.key, file.mimetype, Number(meta.durationMs), buffer.length, checksum, asString(meta.expectedText)]);

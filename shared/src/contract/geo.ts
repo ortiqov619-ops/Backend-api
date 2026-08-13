@@ -169,3 +169,19 @@ export interface UpdateGeofenceRequest {
 export interface UpdateGeofenceResponse {
   geofence: Geofence;
 }
+
+/** Admin hudud katalogini kengaytiradi. Yangi hudud xavfsizlik uchun yopiq yaratiladi. */
+export interface CreateRegionRequest {
+  code: string;
+  nameUz: string;
+  level?: Exclude<Region['level'], 'republic'>;
+  parentId?: Uuid | null;
+  changeReason: string;
+}
+
+export interface UpdateRegionRequest {
+  isContributionAllowed: boolean;
+  changeReason: string;
+}
+
+export interface RegionMutationResponse { region: Region; }

@@ -19,7 +19,7 @@ import type {
   UpdateRequestStatusRequest,
   UpdateRequestStatusResponse,
 } from '../contract/contributions';
-import type { RegionListQuery, RegionListResponse, UpdateGeofenceRequest, UpdateGeofenceResponse } from '../contract/geo';
+import type { CreateRegionRequest, RegionListQuery, RegionListResponse, RegionMutationResponse, UpdateGeofenceRequest, UpdateGeofenceResponse, UpdateRegionRequest } from '../contract/geo';
 import type {
   ArchiveWordRequest,
   ArchiveWordResponse,
@@ -127,6 +127,14 @@ export class XorazmApiClient {
 
   listRegions(query?: RegionListQuery): Promise<RegionListResponse> {
     return this.http.request('GET', '/regions', { query: toQuery(query), auth: false });
+  }
+
+  createRegion(body: CreateRegionRequest): Promise<RegionMutationResponse> {
+    return this.http.request('POST', '/admin/regions', { body });
+  }
+
+  updateRegion(id: Uuid, body: UpdateRegionRequest): Promise<RegionMutationResponse> {
+    return this.http.request('PATCH', `/admin/regions/${id}`, { body });
   }
 
   updateGeofence(id: Uuid, body: UpdateGeofenceRequest): Promise<UpdateGeofenceResponse> {

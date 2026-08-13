@@ -40,7 +40,7 @@ export function checkAudioEnvelope(input: Pick<AudioAnalysisInput, 'durationMs' 
     push(reasons, 'audio_too_short', 'blocker', -100, 'Audio juda qisqa (kamida 0,7 soniya).', `${input.durationMs} ms`);
   }
   if (input.durationMs > AUDIO_LIMITS.maxDurationMs) {
-    push(reasons, 'audio_too_long', 'blocker', -100, 'Audio juda uzun (ko‘pi bilan 30 soniya).', `${input.durationMs} ms`);
+    push(reasons, 'audio_too_long', 'blocker', -100, 'Audio juda uzun (ko‘pi bilan 40 soniya).', `${input.durationMs} ms`);
   }
   if (input.sizeBytes > AUDIO_LIMITS.maxSizeBytes) {
     push(reasons, 'audio_too_long', 'blocker', -100, 'Audio fayl hajmi juda katta.', `${input.sizeBytes} B`);
