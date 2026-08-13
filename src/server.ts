@@ -7,7 +7,7 @@ import cors from '@fastify/cors';
 import multipart from '@fastify/multipart';
 import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify';
 import { Pool, type QueryResultRow } from 'pg';
-import { evaluateLocationGate, phoneticKey, validateContributionText } from '@xorazm/shared';
+import { AUDIO_LIMITS, evaluateLocationGate, phoneticKey, validateContributionText } from '@xorazm/shared';
 import { assertProductionConfig, config } from './config';
 import { decryptSecret, encryptSecret, hashToken, newId, signAccessToken, verifyAccessToken } from './security';
 
@@ -156,7 +156,10 @@ app.post('/v3/auth/admin/login', async (request, reply) => {
   const found = await db.query('SELECT id, full_name, email, phone, password_hash, is_active, locked_until FROM users WHERE email = $1 AND is_anonymous = false', [email]);
   const user = found.rows[0];
   const locked = user?.locked_until && new Date(user.locked_until).getTime() > Date.now();
-  if (!user || !user.is_active || locked || !user.password_hash || !(await bcrypt.compare(password, user.password_hash))) {
+  if (locked) {
+    return apiError(reply, 429, 'rate_limited', 'Hisob 15 daqiqaga vaqtincha himoyalangan. Biroz kutib qayta urinib ko‘ring.');
+  }
+  if (!user || !user.is_active || !user.password_hash || !(await bcrypt.compare(password, user.password_hash))) {
     if (user) await db.query('UPDATE users SET failed_login_count = failed_login_count + 1, locked_until = CASE WHEN failed_login_count + 1 >= 5 THEN now() + interval \'15 minutes\' ELSE locked_until END WHERE id = $1', [user.id]);
     return apiError(reply, 401, 'unauthorized', 'Email yoki parol noto‘g‘ri.');
   }
@@ -294,12 +297,26 @@ app.post('/v3/contributions/audio', async (request, reply) => {
   const buffer = await file.toBuffer();
   const metaText = multipartFieldValue(file.fields.meta); let meta: Json = {};
   try { meta = JSON.parse(String(metaText ?? '{}')) as Json; } catch { return apiError(reply, 422, 'validation_failed', 'Audio metama’lumoti noto‘g‘ri.'); }
+  const headerKey = Array.isArray(request.headers['idempotency-key']) ? request.headers['idempotency-key'][0] : request.headers['idempotency-key'];
+  const idempotencyKey = asString(meta.idempotencyKey) || asString(headerKey);
+  const durationMs = Number(meta.durationMs);
+  if (!idempotencyKey || idempotencyKey.length > 255) return apiError(reply, 422, 'validation_failed', 'Audio idempotency kaliti majburiy.');
+  if (!Number.isFinite(durationMs) || durationMs < AUDIO_LIMITS.minDurationMs || durationMs > AUDIO_LIMITS.maxDurationMs) {
+    return apiError(reply, 422, 'validation_failed', 'Audio davomiyligi 0,7–40 soniya bo‘lishi kerak.');
+  }
+  if (!AUDIO_LIMITS.allowedMimeTypes.includes(file.mimetype as never)) return apiError(reply, 415, 'unsupported_media_type', 'Audio formati qo‘llab-quvvatlanmaydi.');
+  if (!buffer.length || buffer.length > AUDIO_LIMITS.maxSizeBytes) return apiError(reply, 413, 'payload_too_large', 'Audio fayl hajmi noto‘g‘ri.');
+  const existing = await db.query('SELECT * FROM audio_submissions WHERE idempotency_key=$1', [idempotencyKey]);
+  if (existing.rows[0]) {
+    const row = existing.rows[0];
+    return { submission: { id:row.id, contributionRequestId:row.contribution_request_id, wordId:row.word_id, storageKey:row.storage_key, mimeType:row.mime_type, durationMs:row.duration_ms, sizeBytes:row.size_bytes, checksumSha256:row.checksum_sha256, expectedText:row.expected_text, moderationStatus:row.moderation_status, createdAt:iso(row.created_at), updatedAt:iso(row.updated_at) }, userMessage:'Avvalgi audio so‘rovi qaytarildi.' };
+  }
   // Audio ham GPS talab qilmaydi; u faqat avval yaratilgan moderatsiya
-  // so‘roviga biriktiriladi va admin tasdiqlamaguncha nashr etilmaydi.
+  // so'roviga biriktiriladi va admin tasdiqlamaguncha nashr etilmaydi.
   const stored = await storeAudio(buffer, file.filename, file.mimetype); const checksum = createHash('sha256').update(buffer).digest('hex');
-  const created = await db.query(`INSERT INTO audio_submissions (contribution_request_id, word_id, storage_bucket, storage_key, mime_type, duration_ms, size_bytes, checksum_sha256, expected_text, moderation_status)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending') RETURNING *`, [meta.contributionRequestId ?? null, meta.wordId ?? null, stored.bucket, stored.key, file.mimetype, Number(meta.durationMs), buffer.length, checksum, asString(meta.expectedText)]);
-  return { submission: { id: created.rows[0].id, storageKey: stored.key, mimeType: file.mimetype, durationMs: Number(meta.durationMs), sizeBytes: buffer.length, checksumSha256: checksum, expectedText: asString(meta.expectedText), moderationStatus: 'pending' }, userMessage: 'Audio moderator tekshiruviga yuborildi.' };
+  const created = await db.query(`INSERT INTO audio_submissions (contribution_request_id, word_id, storage_bucket, storage_key, mime_type, duration_ms, size_bytes, checksum_sha256, expected_text, moderation_status, idempotency_key)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending',$10) RETURNING *`, [meta.contributionRequestId ?? null, meta.wordId ?? null, stored.bucket, stored.key, file.mimetype, durationMs, buffer.length, checksum, asString(meta.expectedText), idempotencyKey]);
+  return { submission: { id: created.rows[0].id, contributionRequestId:meta.contributionRequestId ?? null, wordId:meta.wordId ?? null, storageKey: stored.key, mimeType: file.mimetype, durationMs, sizeBytes: buffer.length, checksumSha256: checksum, expectedText: asString(meta.expectedText), moderationStatus: 'pending', createdAt:iso(created.rows[0].created_at), updatedAt:iso(created.rows[0].updated_at) }, userMessage: 'Audio moderator tekshiruviga yuborildi.' };
 });
 
 app.get('/v3/requests', async (request, reply) => {

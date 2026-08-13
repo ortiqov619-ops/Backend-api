@@ -13,6 +13,7 @@ const migrations = [
   '0002_seed_reference_data.sql',
   '0004_app_open_events.sql',
   '0005_community_interactions.sql',
+  '0006_audio_idempotency.sql',
 ];
 
 const db = new Pool({
