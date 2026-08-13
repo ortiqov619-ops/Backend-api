@@ -24,7 +24,7 @@ export class ApiError extends Error {
   get userMessage(): string {
     switch (this.code) {
       case 'unauthorized':
-        return 'Sessiya tugadi. Qaytadan kiring.';
+        return this.message || 'Sessiya tugadi. Qaytadan kiring.';
       case 'forbidden':
         return 'Bu amal uchun ruxsatingiz yo‘q.';
       case 'rate_limited':
@@ -37,7 +37,7 @@ export class ApiError extends Error {
       case 'conflict':
         return 'Bu yozuv boshqa moderator tomonidan o‘zgartirilgan. Ro‘yxatni yangilang.';
       case 'provider_unavailable':
-        return 'Tashqi xizmat vaqtincha ishlamayapti.';
+        return this.message || 'Tashqi xizmat vaqtincha ishlamayapti.';
       default:
         return this.message || 'Kutilmagan xatolik yuz berdi.';
     }
@@ -70,6 +70,13 @@ export interface RequestOptions {
   auth?: boolean;
 }
 
+export interface BackendWarmupOptions {
+  /** Render Free sovuq ishga tushishi uchun umumiy kutish chegarasi. */
+  timeoutMs?: number;
+  /** Har bir health so'rovining eng uzun davomiyligi. */
+  attemptTimeoutMs?: number;
+}
+
 function buildUrl(baseUrl: string, path: string, query?: RequestOptions['query']): string {
   const url = `${baseUrl.replace(/\/+$/, '')}/${path.replace(/^\/+/, '')}`;
   if (!query) return url;
@@ -91,11 +98,76 @@ function isApiErrorBody(value: unknown): value is ApiErrorBody {
   );
 }
 
+function backendHealthUrl(baseUrl: string): string {
+  const root = baseUrl.replace(/\/+$/, '').replace(/\/v3$/, '');
+  return `${root}/health`;
+}
+
+const activeWarmups = new Map<string, Promise<void>>();
+
+function wait(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Uxlayotgan backendni maxfiy ma'lumotsiz `/health` orqali uyg'otadi.
+ * Bir vaqtda bir necha ekran chaqirsa ham tarmoqqa faqat bitta oqim ketadi.
+ */
+export function warmBackend(baseUrl: string, options: BackendWarmupOptions = {}): Promise<void> {
+  const healthUrl = backendHealthUrl(baseUrl);
+  const existing = activeWarmups.get(healthUrl);
+  if (existing) return existing;
+
+  const task = (async () => {
+    const deadline = Date.now() + (options.timeoutMs ?? 90_000);
+    let lastStatus: number | null = null;
+    while (Date.now() < deadline) {
+      const controller = new AbortController();
+      const remaining = deadline - Date.now();
+      const timeout = setTimeout(
+        () => controller.abort(),
+        Math.max(250, Math.min(options.attemptTimeoutMs ?? 20_000, remaining)),
+      );
+      try {
+        const response = await fetch(healthUrl, {
+          method: 'GET',
+          headers: { Accept: 'application/json', 'Cache-Control': 'no-cache' },
+          signal: controller.signal,
+        });
+        lastStatus = response.status;
+        if (response.ok) return;
+      } catch {
+        // Cold-start, DNS almashinuvi va qisqa uzilishlarda deadlinegacha uriniladi.
+      } finally {
+        clearTimeout(timeout);
+      }
+      if (Date.now() < deadline) await wait(1_200);
+    }
+    throw new ApiError({
+      code: 'provider_unavailable',
+      status: lastStatus ?? 0,
+      message: lastStatus
+        ? `Server ishga tushmadi (HTTP ${lastStatus}). Birozdan so‘ng qayta urinib ko‘ring.`
+        : 'Serverga ulanib bo‘lmadi. Internet aloqasini tekshirib, qayta urinib ko‘ring.',
+    });
+  })();
+
+  activeWarmups.set(healthUrl, task);
+  void task.finally(() => {
+    if (activeWarmups.get(healthUrl) === task) activeWarmups.delete(healthUrl);
+  }).catch(() => undefined);
+  return task;
+}
+
 export class HttpClient {
   constructor(private readonly options: HttpClientOptions) {}
 
   get baseUrl(): string {
     return this.options.baseUrl;
+  }
+
+  warmup(options?: BackendWarmupOptions): Promise<void> {
+    return warmBackend(this.options.baseUrl, options);
   }
 
   async request<T>(method: 'GET' | 'POST' | 'PATCH' | 'PUT' | 'DELETE', path: string, opts: RequestOptions = {}): Promise<T> {
@@ -140,7 +212,20 @@ export class HttpClient {
       if (response.status === 204) return undefined as T;
 
       const text = await response.text();
-      const payload: unknown = text ? JSON.parse(text) : null;
+      let payload: unknown = null;
+      if (text) {
+        try {
+          payload = JSON.parse(text);
+        } catch {
+          throw new ApiError({
+            code: 'internal_error',
+            status: response.status,
+            message: response.ok
+              ? 'Server tushunarsiz javob qaytardi. Ilovani yangilab, qayta urinib ko‘ring.'
+              : `Server vaqtincha javob bermadi (HTTP ${response.status}).`,
+          });
+        }
+      }
 
       if (!response.ok) {
         if (isApiErrorBody(payload)) {
@@ -164,7 +249,11 @@ export class HttpClient {
       if (error instanceof Error && error.name === 'AbortError') {
         throw new ApiError({ code: 'internal_error', status: 0, message: 'So‘rov vaqti tugadi.' });
       }
-      throw new ApiError({ code: 'internal_error', status: 0, message: 'Tarmoq bilan aloqa yo‘q.' });
+      throw new ApiError({
+        code: 'internal_error',
+        status: 0,
+        message: 'Serverga ulanib bo‘lmadi. Internet ishlayotgan bo‘lsa, birozdan so‘ng qayta urinib ko‘ring.',
+      });
     } finally {
       clearTimeout(timeout);
     }

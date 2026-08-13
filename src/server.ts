@@ -8,7 +8,15 @@ import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify';
 import { Pool, type PoolClient, type QueryResultRow } from 'pg';
 import { AUDIO_LIMITS, evaluateLocationGate, phoneticKey, validateContributionText } from '@xorazm/shared';
 import { fixedWindow, normalizeExpectedText, sameAudioFingerprint, type AudioIdempotencyFingerprint } from './audio-hardening';
+import {
+  audioStatusForRequestDecision,
+  AudioModerationValidationError,
+  isRecordableDecision,
+  isSameInstant,
+  parseAudioDecision,
+} from './audio-moderation';
 import { assertProductionConfig, config } from './config';
+import { translateDatabaseError } from './db-errors';
 import {
   canBeChildOf,
   canCreateRegionUnder,
@@ -60,7 +68,32 @@ function requiredIso(value: unknown): string { return new Date(String(value)).to
 function page(input: unknown, fallback = 1): number { const value = Number(input ?? fallback); return Number.isFinite(value) ? Math.max(1, Math.floor(value)) : fallback; }
 function pageSize(input: unknown): number { return Math.min(100, Math.max(1, page(input, 20))); }
 function apiError(reply: FastifyReply, status: number, code: string, message: string, fields?: Record<string, string[]>) {
-  return reply.status(status).send({ error: { code, message, ...(fields ? { fields } : {}), requestId: newId() } });
+  // `requestId` Fastify logidagi `reqId` bilan bir xil bo'lishi shart: aks
+  // holda mijoz ko'rgan xatoni server logidan topib bo'lmaydi.
+  const requestId = reply.request?.id ?? newId();
+  return reply.status(status).send({ error: { code, message, ...(fields ? { fields } : {}), requestId: String(requestId) } });
+}
+
+/**
+ * Route ichidagi yagona xato chiqishi: `RouteFault` — bilib turib qaytarilgan
+ * javob, tanilgan SQLSTATE — xavfsiz tarjima, qolgani — umumiy `500`.
+ * Xatoning matni yoki `detail` maydoni mijozga hech qachon ko'chirilmaydi.
+ */
+function failFromError(reply: FastifyReply, error: unknown, context: string): FastifyReply {
+  if (error instanceof RouteFault) return apiError(reply, error.status, error.code, error.message);
+
+  const translated = translateDatabaseError(error);
+  if (translated) {
+    if (translated.serverDefect) {
+      app.log.error({ err: error, context, reqId: reply.request?.id }, 'SQL nuqsoni: so‘rov bajarilmadi');
+    } else {
+      app.log.warn({ err: error, context, reqId: reply.request?.id }, 'Ma’lumotlar bazasi so‘rovni rad etdi');
+    }
+    return apiError(reply, translated.status, translated.code, translated.message);
+  }
+
+  app.log.error({ err: error, context, reqId: reply.request?.id }, 'Kutilmagan xatolik');
+  return apiError(reply, 500, 'internal_error', 'Serverda kutilmagan xatolik yuz berdi.');
 }
 function asObject(value: unknown): Json { return typeof value === 'object' && value !== null ? value as Json : {}; }
 function asString(value: unknown): string { return typeof value === 'string' ? value.trim() : ''; }
@@ -371,8 +404,44 @@ async function mapAudioSubmission(row: QueryResultRow) {
       failureMessage: row.audio_failure_message ?? row.failure_message ?? null,
     },
     moderationStatus: row.audio_moderation_status ?? row.moderation_status,
+    version: Number(row.audio_version ?? row.version ?? 1),
+    supersededAt: iso(row.audio_superseded_at ?? row.superseded_at),
     createdAt: requiredIso(createdAt),
     updatedAt: requiredIso(updatedAt),
+  };
+}
+
+/**
+ * Moderator audioni baholash uchun uning kontekstini ko'rishi kerak: bu yangi
+ * taklifmi, mavjud lug'at so'ziga qo'shilgan talaffuzmi, yoki bog'lanishi
+ * uzilgan yozuvmi. Uchinchi holat 0007 migratsiyasidan keyin real mavjud.
+ */
+function audioContext(row: QueryResultRow) {
+  if (row.ctx_request_id) {
+    const payload = asObject(row.ctx_request_payload);
+    return {
+      kind: 'contribution_request' as const,
+      id: String(row.ctx_request_id),
+      word: asString(payload.word) || String(row.expected_text),
+      meaning: nullableString(payload.meaning),
+      status: row.ctx_request_status ?? null,
+    };
+  }
+  if (row.ctx_word_id) {
+    return {
+      kind: 'word' as const,
+      id: String(row.ctx_word_id),
+      word: String(row.ctx_word),
+      meaning: nullableString(row.ctx_word_meaning),
+      status: row.ctx_word_status ?? null,
+    };
+  }
+  return {
+    kind: 'detached' as const,
+    id: String(row.id),
+    word: String(row.expected_text),
+    meaning: null,
+    status: null,
   };
 }
 
@@ -380,21 +449,83 @@ async function mapRequest(row: QueryResultRow) {
   const audio = row.audio_id ? await mapAudioSubmission(row) : null;
   return { id: row.id, type: row.type, status: row.status, payload: row.payload, submittedByUserId: row.submitted_by_user_id, submittedByDisplayName: row.submitted_by_display_name, device: row.device, latitude: row.latitude, longitude: row.longitude, locationAccuracyM: row.location_accuracy_m, locationCheckedAt: iso(row.location_checked_at), submissionLocationStatus: row.submission_location_status, matchedGeofenceId: row.matched_geofence_id, geofenceVersion: row.geofence_version, validationVerdict: row.validation_verdict, validationScore: row.validation_score, validationResults: row.validation_results ?? [], audio, clarificationNote: row.clarification_note, resolvedAt: iso(row.resolved_at), resolvedByUserId: row.resolved_by_user_id, resultWordId: row.result_word_id, createdAt: iso(row.created_at), updatedAt: iso(row.updated_at) };
 }
-const requestSql = `SELECT cr.*, a.id AS audio_id, a.contribution_request_id AS audio_contribution_request_id, a.word_id AS audio_word_id, a.storage_bucket, a.storage_key, a.mime_type, a.duration_ms, a.size_bytes, a.sample_rate_hz, a.checksum_sha256, a.expected_text, a.analysis_status, a.pipeline_stage, a.transcript, a.transcript_confidence, a.detected_language, a.dialect_confidence, a.pronunciation_similarity, a.text_audio_match, a.overall_score, a.analysis_reasons, a.requires_human_review AS audio_requires_review, a.engine_name AS audio_engine_name, a.engine_version AS audio_engine_version, a.engine_provider AS audio_engine_provider, a.failure_message AS audio_failure_message, a.moderation_status AS audio_moderation_status, a.analyzed_at, a.created_at AS audio_created_at, a.updated_at AS audio_updated_at,
+const requestSql = `SELECT cr.*, a.id AS audio_id, a.contribution_request_id AS audio_contribution_request_id, a.word_id AS audio_word_id, a.storage_bucket, a.storage_key, a.mime_type, a.duration_ms, a.size_bytes, a.sample_rate_hz, a.checksum_sha256, a.expected_text, a.analysis_status, a.pipeline_stage, a.transcript, a.transcript_confidence, a.detected_language, a.dialect_confidence, a.pronunciation_similarity, a.text_audio_match, a.overall_score, a.analysis_reasons, a.requires_human_review AS audio_requires_review, a.engine_name AS audio_engine_name, a.engine_version AS audio_engine_version, a.engine_provider AS audio_engine_provider, a.failure_message AS audio_failure_message, a.moderation_status AS audio_moderation_status, a.version AS audio_version, a.superseded_at AS audio_superseded_at, a.analyzed_at, a.created_at AS audio_created_at, a.updated_at AS audio_updated_at,
   COALESCE((SELECT jsonb_agg(jsonb_build_object('subject', vr.subject, 'verdict', vr.verdict, 'score', vr.score, 'confidence', vr.confidence, 'reasons', vr.reasons, 'origin', vr.origin, 'evaluatedAt', vr.evaluated_at)) FROM validation_results vr WHERE vr.contribution_request_id = cr.id), '[]'::jsonb) AS validation_results
 FROM contribution_requests cr
 LEFT JOIN LATERAL (
+  -- Faqat joriy versiya: almashtirilgan yozuv audit uchun qoladi, lekin
+  -- moderatorga eski talaffuz ko'rsatilmaydi.
   SELECT candidate.*
   FROM audio_submissions candidate
-  WHERE candidate.contribution_request_id = cr.id
+  WHERE candidate.contribution_request_id = cr.id AND candidate.superseded_at IS NULL
   ORDER BY candidate.created_at DESC, candidate.id DESC
   LIMIT 1
 ) a ON true`;
 
+const INTEGRATION_SELECT = `SELECT s.*, u.full_name AS last_rotated_by_name
+  FROM integration_secrets s
+  LEFT JOIN users u ON u.id = s.last_rotated_by`;
+
+/**
+ * Serverda haqiqiy mijozi bor providerlar. Qolganlari uchun kalit saqlanadi,
+ * lekin hech qayerda ishlatilmaydi — panel buni ochiq ko'rsatishi kerak.
+ */
+const SUPPORTED_INTEGRATIONS = new Set(['stt_primary']);
+
+function mapIntegration(row: QueryResultRow) {
+  return {
+    provider: row.provider,
+    displayName: row.display_name,
+    isConfigured: !!row.secret_ciphertext,
+    maskedHint: row.masked_hint,
+    keyVersion: row.key_version,
+    lastRotatedAt: iso(row.last_rotated_at),
+    lastRotatedBy: row.last_rotated_by_name ?? null,
+    lastUsedAt: iso(row.last_used_at),
+    health: row.health,
+    healthCheckedAt: iso(row.health_checked_at),
+    publicConfig: row.public_config,
+    isEnabled: row.is_enabled,
+    isSupported: SUPPORTED_INTEGRATIONS.has(String(row.provider)),
+  };
+}
+
+type IntegrationHealth = 'unknown' | 'ok' | 'degraded' | 'failing' | 'not_configured';
+
+/** Kalitni ochib ko'rsatmasdan, provider javob berishini tekshiradi. */
+async function checkIntegrationHealth(provider: string, isConfigured: boolean, isEnabled: boolean): Promise<{ health: IntegrationHealth; message: string }> {
+  if (!isConfigured) return { health: 'not_configured', message: 'Kalit hali kiritilmagan.' };
+  if (!isEnabled) return { health: 'not_configured', message: 'Integratsiya o‘chirilgan holatda.' };
+  if (!SUPPORTED_INTEGRATIONS.has(provider)) {
+    return { health: 'unknown', message: 'Kalit saqlandi, ammo bu provider serverda hali ulanmagan — u hozircha ishlatilmaydi.' };
+  }
+
+  const key = await loadIntegrationSecret(provider);
+  if (!key) return { health: 'not_configured', message: 'Kalitni o‘qib bo‘lmadi. Uni qaytadan kiriting.' };
+  try {
+    const response = await fetch('https://api.groq.com/openai/v1/models', {
+      headers: { Authorization: `Bearer ${key}` },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (response.ok) return { health: 'ok', message: 'Provider javob berdi, kalit qabul qilindi.' };
+    if (response.status === 401 || response.status === 403) {
+      return { health: 'failing', message: 'Provider kalitni qabul qilmadi. Kalitni qaytadan kiriting.' };
+    }
+    return { health: 'degraded', message: `Provider javob berdi, ammo holat kodi ${response.status}.` };
+  } catch {
+    // Xato matni (host, kalit bo'lagi) mijozga ko'chirilmaydi.
+    return { health: 'failing', message: 'Providerga ulanib bo‘lmadi. Internet yoki xizmat holatini tekshiring.' };
+  }
+}
+
 async function loadIntegrationSecret(provider: string): Promise<string | null> {
   const result = await db.query<{ secret_ciphertext: Buffer | null; secret_nonce: Buffer | null }>('SELECT secret_ciphertext, secret_nonce FROM integration_secrets WHERE provider = $1 AND is_enabled = true', [provider]);
   const row = result.rows[0];
-  return row?.secret_ciphertext && row.secret_nonce ? decryptSecret(row.secret_ciphertext, row.secret_nonce) : null;
+  if (!row?.secret_ciphertext || !row.secret_nonce) return null;
+  // Egasi kalit haqiqatan ishlatilayotganini panelda ko'rishi uchun.
+  void db.query('UPDATE integration_secrets SET last_used_at = now() WHERE provider = $1', [provider])
+    .catch((error: unknown) => app.log.warn(error, 'Integratsiya foydalanish vaqti yangilanmadi'));
+  return decryptSecret(row.secret_ciphertext, row.secret_nonce);
 }
 async function storeAudio(buffer: Buffer, filename: string, mimeType: string): Promise<{ bucket: string; key: string }> {
   const key = `${new Date().toISOString().slice(0, 10)}/${newId()}-${basename(filename).replace(/[^a-zA-Z0-9._-]/g, '_')}`;
@@ -817,9 +948,21 @@ app.post('/v3/contributions/audio', async (request, reply) => {
       throw new RouteFault(409, 'conflict', 'Nashr qilinmagan lug‘at so‘ziga audio qo‘shib bo‘lmaydi.');
     }
 
+    let supersededAudioId: string | null = null;
+    let nextVersion = 1;
     if (contributionRequestId) {
-      const attached = await client.query('SELECT id FROM audio_submissions WHERE contribution_request_id=$1 LIMIT 1', [contributionRequestId]);
-      if (attached.rows[0]) throw new RouteFault(409, 'conflict', 'Bu taklifga audio allaqachon biriktirilgan.');
+      const attached = await client.query('SELECT id, version, moderation_status::text AS moderation_status FROM audio_submissions WHERE contribution_request_id=$1 AND superseded_at IS NULL LIMIT 1', [contributionRequestId]);
+      const currentAudio = attached.rows[0];
+      if (currentAudio) {
+        // Moderator «qayta yozishni so'rash» yoki «rad etish» qarorini bergan
+        // bo'lsa, foydalanuvchi yangi talaffuz yuborishi mumkin. Eski yozuv
+        // o'chirilmaydi — u audit dalili bo'lib qoladi.
+        if (!['needs_clarification', 'rejected'].includes(String(currentAudio.moderation_status))) {
+          throw new RouteFault(409, 'conflict', 'Bu taklifga audio allaqachon biriktirilgan.');
+        }
+        supersededAudioId = String(currentAudio.id);
+        nextVersion = Number(currentAudio.version ?? 1) + 1;
+      }
     } else {
       const duplicate = await client.query('SELECT id FROM audio_submissions WHERE word_id=$1 AND checksum_sha256=$2 LIMIT 1', [wordId, checksumSha256]);
       if (duplicate.rows[0]) throw new RouteFault(409, 'conflict', 'Aynan shu audio lug‘at so‘ziga avval qo‘shilgan.');
@@ -828,8 +971,16 @@ app.post('/v3/contributions/audio', async (request, reply) => {
     // Storage yozuvi transaction lock ostida yaratiladi. Keyingi DB bosqichi
     // xato bersa exact key darhol o‘chiriladi va orphan fayl qolmaydi.
     stored = await storeAudio(buffer, file.filename, file.mimetype);
-    const created = await client.query(`INSERT INTO audio_submissions (contribution_request_id, word_id, storage_bucket, storage_key, mime_type, duration_ms, size_bytes, checksum_sha256, expected_text, moderation_status, idempotency_key)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending',$10) RETURNING *`, [contributionRequestId, wordId, stored.bucket, stored.key, file.mimetype, durationMs, buffer.length, checksumSha256, expectedText, idempotencyKey]);
+    // Eski versiya avval belgilanadi: «bitta joriy audio» unikal indeksi
+    // ikkitasi bir vaqtda joriy bo'lishiga yo'l qo'ymaydi.
+    if (supersededAudioId) {
+      await client.query('UPDATE audio_submissions SET superseded_at=now() WHERE id=$1', [supersededAudioId]);
+    }
+    const created = await client.query(`INSERT INTO audio_submissions (contribution_request_id, word_id, storage_bucket, storage_key, mime_type, duration_ms, size_bytes, checksum_sha256, expected_text, moderation_status, idempotency_key, version)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending',$10,$11) RETURNING *`, [contributionRequestId, wordId, stored.bucket, stored.key, file.mimetype, durationMs, buffer.length, checksumSha256, expectedText, idempotencyKey, nextVersion]);
+    if (supersededAudioId) {
+      await client.query('UPDATE audio_submissions SET superseded_by=$2 WHERE id=$1', [supersededAudioId, created.rows[0].id]);
+    }
     await client.query('COMMIT');
     transactionOpen = false;
     stored = null;
@@ -837,9 +988,7 @@ app.post('/v3/contributions/audio', async (request, reply) => {
   } catch (error) {
     if (transactionOpen) await client.query('ROLLBACK').catch(() => undefined);
     if (stored) await deleteStoredAudio(stored);
-    if (error instanceof RouteFault) return apiError(reply, error.status, error.code, error.message);
-    if ((error as { code?: string }).code === '23505') return apiError(reply, 409, 'conflict', 'Audio allaqachon biriktirilgan.');
-    throw error;
+    return failFromError(reply, error, 'contributions.audio');
   } finally {
     client.release();
   }
@@ -863,6 +1012,118 @@ app.get('/v3/requests', async (request, reply) => {
   const current = page(query.page); const size = pageSize(query.pageSize); const count = await db.query(`SELECT count(*)::int AS total FROM contribution_requests cr ${where.length ? `WHERE ${where.join(' AND ')}` : ''}`, params); params.push(size, (current - 1) * size);
   const rows = await db.query(`${requestSql} ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY cr.created_at DESC LIMIT $${params.length - 1} OFFSET $${params.length}`, params); const total = count.rows[0].total;
   return { items: await Promise.all(rows.rows.map(mapRequest)), meta: { page: current, pageSize: size, total, totalPages: Math.ceil(total / size) } };
+});
+
+/**
+ * Audio navbati. So'rovlar ro'yxatidan mustaqil, chunki audio uch xil holatda
+ * bo'ladi: yangi taklifga biriktirilgan, nashr etilgan lug'at so'ziga
+ * biriktirilgan, yoki (0007 migratsiyasi dublikatni ajratgani sabab) hech
+ * qayerga bog'lanmagan. Oldingi ro'yxat faqat birinchisini ko'rsatardi.
+ */
+app.get('/v3/audio/moderation', async (request, reply) => {
+  if (!(await requirePermission(request, reply, 'audio:read'))) return;
+  const query = request.query as Json;
+  const params: unknown[] = [];
+  const where: string[] = [];
+  const status = asString(query.status);
+  if (status) {
+    if (!['pending', 'approved', 'rejected', 'needs_clarification'].includes(status)) {
+      return apiError(reply, 422, 'validation_failed', 'Audio holati noto‘g‘ri.');
+    }
+    params.push(status);
+    where.push(`a.moderation_status = $${params.length}::moderation_status`);
+  }
+  if (query.analysisStatus) { params.push(asString(query.analysisStatus)); where.push(`a.analysis_status = $${params.length}::audio_analysis_status`); }
+  // Almashtirilgan (qayta yozilgan) versiyalar navbatda ko'rinmaydi — ular
+  // faqat audit uchun saqlanadi.
+  if (!bool(query.includeSuperseded)) where.push('a.superseded_at IS NULL');
+  const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  const current = page(query.page);
+  const size = pageSize(query.pageSize);
+  const count = await db.query<{ total: number }>(`SELECT count(*)::int AS total FROM audio_submissions a ${clause}`, params);
+  params.push(size, (current - 1) * size);
+  const rows = await db.query(`SELECT a.*,
+      cr.id AS ctx_request_id, cr.status::text AS ctx_request_status, cr.payload AS ctx_request_payload,
+      w.id AS ctx_word_id, w.word AS ctx_word, w.meaning AS ctx_word_meaning, w.status::text AS ctx_word_status
+    FROM audio_submissions a
+    LEFT JOIN contribution_requests cr ON cr.id = a.contribution_request_id
+    LEFT JOIN words w ON w.id = a.word_id
+    ${clause}
+    ORDER BY a.created_at ASC, a.id ASC
+    LIMIT $${params.length - 1} OFFSET $${params.length}`, params);
+  const total = count.rows[0]?.total ?? 0;
+  return {
+    items: await Promise.all(rows.rows.map(async (row) => ({
+      submission: await mapAudioSubmission(row),
+      context: audioContext(row),
+    }))),
+    meta: { page: current, pageSize: size, total, totalPages: Math.ceil(total / size) },
+  };
+});
+
+/**
+ * Audio qarori. FAQAT `audio_submissions` yozuvini o'zgartiradi: so'rov
+ * statusiga ham, `words` jadvaliga ham tegmaydi.
+ */
+app.patch('/v3/audio/:id/moderation', async (request, reply) => {
+  const claims = await requirePermission(request, reply, 'audio:moderate');
+  if (!claims) return;
+  const audioId = asString((request.params as Json).id);
+  if (!isUuid(audioId)) return apiError(reply, 404, 'not_found', 'Audio topilmadi.');
+
+  let decision: ReturnType<typeof parseAudioDecision>;
+  try {
+    decision = parseAudioDecision(request.body);
+  } catch (error) {
+    if (error instanceof AudioModerationValidationError) {
+      return apiError(reply, 422, 'validation_failed', error.message, { [error.field]: [error.message] });
+    }
+    throw error;
+  }
+
+  const client: PoolClient = await db.connect();
+  try {
+    await client.query('BEGIN');
+    const locked = await client.query('SELECT * FROM audio_submissions WHERE id=$1 FOR UPDATE', [audioId]);
+    const previous = locked.rows[0];
+    if (!previous) throw new RouteFault(404, 'not_found', 'Audio topilmadi.');
+    if (!isSameInstant(decision.expectedUpdatedAt, iso(previous.updated_at))) {
+      throw new RouteFault(409, 'conflict', 'Bu audio boshqa moderator tomonidan yangilangan. Ro‘yxatni yangilang.');
+    }
+
+    const updated = await client.query(
+      'UPDATE audio_submissions SET moderation_status=$2::moderation_status WHERE id=$1 RETURNING *',
+      [audioId, decision.decision],
+    );
+    await client.query(
+      `INSERT INTO moderation_decisions (contribution_request_id, audio_submission_id, moderator_id, decision, reason, automated_score)
+       VALUES ($1,$2,$3,$4::moderation_status,$5,$6)`,
+      [previous.contribution_request_id ?? null, audioId, claims.sub, decision.decision, decision.reason, previous.overall_score ?? null],
+    );
+    const auditLogId = await audit(claims, 'audio.decision', 'audio_submission', audioId, decision.reason, {
+      moderationStatus: decision.decision,
+      previousStatus: previous.moderation_status,
+      source: 'audio_queue',
+      contributionRequestId: previous.contribution_request_id ?? null,
+      wordId: previous.word_id ?? null,
+    }, request, client);
+    await client.query('COMMIT');
+
+    const context = await db.query(`SELECT a.*,
+        cr.id AS ctx_request_id, cr.status::text AS ctx_request_status, cr.payload AS ctx_request_payload,
+        w.id AS ctx_word_id, w.word AS ctx_word, w.meaning AS ctx_word_meaning, w.status::text AS ctx_word_status
+      FROM audio_submissions a
+      LEFT JOIN contribution_requests cr ON cr.id = a.contribution_request_id
+      LEFT JOIN words w ON w.id = a.word_id
+      WHERE a.id=$1`, [audioId]);
+    const row = context.rows[0] ?? updated.rows[0];
+    return { submission: await mapAudioSubmission(row), context: audioContext(row), auditLogId };
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    return failFromError(reply, error, 'audio.moderation');
+  } finally {
+    client.release();
+  }
 });
 
 app.patch('/v3/requests/:id/status', async (request, reply) => {
@@ -906,8 +1167,23 @@ app.patch('/v3/requests/:id/status', async (request, reply) => {
       const createdWord = await client.query(`INSERT INTO words (word, literary_form, meaning, example, category, phonetic_key, status, region_id, district_id, village_id, dialect_id, clan, dialect_score, source_request_id) VALUES ($1,$2,$3,$4,$5,$6,'published',$7,$8,$9,$10,$11,$12,$13) RETURNING id`, [published.word, published.literaryForm ?? null, published.meaning, published.example ?? null, published.category ?? null, phoneticKey(String(published.word)), published.regionId ?? null, published.districtId ?? null, published.villageId ?? null, published.dialectId ?? null, published.clan ?? null, previous.validation_score, id]);
       wordId = createdWord.rows[0].id;
     }
-    await client.query(`UPDATE contribution_requests SET status=$2, payload=$3, clarification_note=$4, resolved_at=CASE WHEN $2='needs_clarification' THEN NULL ELSE now() END, resolved_by_user_id=CASE WHEN $2='needs_clarification' THEN NULL ELSE $5 END, result_word_id=$6 WHERE id=$1`, [id,status,storedPayload,reason || null,claims.sub,wordId]);
-    if (bool(body.applyToAudio)) await client.query('UPDATE audio_submissions SET moderation_status=$2 WHERE contribution_request_id=$1', [id,status]);
+    // `$2` uch joyda ishlatiladi. Cast bo'lmasa PostgreSQL uni bir joyda
+    // `moderation_status`, boshqasida `text` deb deduksiya qiladi va prepared
+    // statement `42P08 inconsistent types deduced for parameter $2` bilan
+    // yiqiladi — audio va so'z tasdiqlashdagi `500` ning aynan sababi shu edi.
+    await client.query(`UPDATE contribution_requests SET status=$2::moderation_status, payload=$3, clarification_note=$4, resolved_at=CASE WHEN $2::moderation_status='needs_clarification' THEN NULL ELSE now() END, resolved_by_user_id=CASE WHEN $2::moderation_status='needs_clarification' THEN NULL ELSE $5 END, result_word_id=$6 WHERE id=$1`, [id,status,storedPayload,reason || null,claims.sub,wordId]);
+    if (bool(body.applyToAudio)) {
+      // So'z bo'yicha aniqlashtirish so'ralganda audio baholanmagan bo'lib
+      // qoladi: aks holda u navbatdan tushib ketadi va qayta ko'rilmaydi.
+      const audioStatus = audioStatusForRequestDecision(status);
+      const applied = await client.query<{ id: string }>('UPDATE audio_submissions SET moderation_status=$2::moderation_status WHERE contribution_request_id=$1 RETURNING id', [id, audioStatus]);
+      for (const audioRow of applied.rows) {
+        if (isRecordableDecision(audioStatus)) {
+          await client.query('INSERT INTO moderation_decisions (audio_submission_id, moderator_id, decision, reason) VALUES ($1,$2,$3::moderation_status,$4)', [audioRow.id, claims.sub, audioStatus, reason || null]);
+        }
+        await audit(claims, 'audio.decision', 'audio_submission', audioRow.id, reason || null, { moderationStatus: audioStatus, source: 'request_decision', contributionRequestId: id }, request, client);
+      }
+    }
     await client.query('INSERT INTO moderation_decisions (contribution_request_id, moderator_id, decision, reason, automated_verdict, automated_score) VALUES ($1,$2,$3,$4,$5,$6)', [id,claims.sub,status,reason || null,previous.validation_verdict,previous.validation_score]);
     const auditLogId = await audit(claims, 'request.status_change', 'contribution_request', id, reason || null, { status, wordId, regionResolution, dialectResolution }, request, client);
     await client.query('COMMIT');
@@ -915,9 +1191,7 @@ app.patch('/v3/requests/:id/status', async (request, reply) => {
     return { request: await mapRequest(updated.rows[0]), createdWordId: wordId, auditLogId };
   } catch (error) {
     await client.query('ROLLBACK').catch(() => undefined);
-    if (error instanceof RouteFault) return apiError(reply, error.status, error.code, error.message);
-    if ((error as { code?: string }).code === '23505') return apiError(reply, 409, 'conflict', 'Shunga o‘xshash so‘z bu hududda allaqachon mavjud.');
-    throw error;
+    return failFromError(reply, error, 'request.status_change');
   } finally {
     client.release();
   }
@@ -970,10 +1244,166 @@ app.get('/v3/admin/audit-logs', async (request, reply) => {
   return { items: rows.rows.map((row) => ({ id:String(row.id), action:row.action, entityType:row.entity_type, entityId:row.entity_id, actorId:row.actor_id, actorName:row.actor_name, actorRoles:row.actor_roles ?? [], ipAddress:row.ip_address, userAgent:row.user_agent, before:row.before_data, after:row.after_data, changedFields:row.changed_fields ?? [], reason:row.reason, createdAt:iso(row.created_at) })), meta:{ page:current,pageSize:size,total,totalPages:Math.ceil(total/size) } };
 });
 
-app.get('/v3/admin/dashboard', async (request, reply) => { if (!(await requirePermission(request, reply, 'dashboard:read'))) return; const [counts, regions, queue] = await Promise.all([db.query(`SELECT count(*) FILTER (WHERE status='pending')::int AS pending, count(*) FILTER (WHERE status='approved' AND resolved_at::date=current_date)::int AS approved_today, count(*) FILTER (WHERE status='rejected' AND resolved_at::date=current_date)::int AS rejected_today, count(*) FILTER (WHERE status='needs_clarification')::int AS clarification FROM contribution_requests`), db.query('SELECT * FROM v_region_stats ORDER BY word_count DESC LIMIT 12'), db.query(`${requestSql} WHERE cr.status IN ('pending','needs_clarification') ORDER BY cr.created_at DESC LIMIT 5`)]); const audio = await db.query(`SELECT count(*) FILTER (WHERE moderation_status='pending')::int AS queue, count(*) FILTER (WHERE analysis_status='pending_analysis')::int AS pending, count(*)::int AS total FROM audio_submissions`); const c = counts.rows[0]; const a = audio.rows[0]; return { counters: { pendingRequests:c.pending, approvedToday:c.approved_today, rejectedToday:c.rejected_today, needsClarification:c.clarification, audioQueue:a.queue, audioPendingAnalysis:a.pending, flaggedLocation:0, totalWords:(await db.query(`SELECT count(*)::int AS n FROM words WHERE status='published'`)).rows[0].n, totalAudio:a.total }, regionStats: regions.rows.map((row) => ({ regionId:row.region_id, regionName:row.region_name, wordCount:Number(row.word_count), audioCount:Number(row.audio_count), pendingCount:Number(row.pending_count), avgDialectScore:Number(row.avg_dialect_score) })), recentQueue: queue.rows.map((row) => ({ id:row.id,title:row.payload.word,subtitle:row.payload.meaning,status:row.status,score:row.validation_score,hasAudio:!!row.audio_id,flagged:row.submission_location_status!=='inside',createdAt:iso(row.created_at) })), trend: [], generatedAt:new Date().toISOString() }; });
+/**
+ * Joylashuv endi majburiy emas, shuning uchun `not_provided` — odatiy holat,
+ * shubha emas. «Belgilangan» deb faqat server geofence bo'yicha muammo
+ * aniqlagan holatlar sanaladi.
+ */
+const FLAGGED_LOCATION_SQL = `submission_location_status NOT IN ('inside', 'not_provided')`;
 
-app.get('/v3/admin/integrations', async (request, reply) => { if (!(await requirePermission(request, reply, 'integrations:read'))) return; const rows = await db.query('SELECT s.*, u.full_name AS last_rotated_by_name FROM integration_secrets s LEFT JOIN users u ON u.id=s.last_rotated_by ORDER BY s.provider'); return { items: rows.rows.map((row) => ({ provider:row.provider,displayName:row.display_name,isConfigured:!!row.secret_ciphertext,maskedHint:row.masked_hint,keyVersion:row.key_version,lastRotatedAt:iso(row.last_rotated_at),lastRotatedBy:row.last_rotated_by_name,lastUsedAt:iso(row.last_used_at),health:row.health,healthCheckedAt:iso(row.health_checked_at),publicConfig:row.public_config,isEnabled:row.is_enabled })), encryption:{ algorithm:'AES-256-GCM',keySource:'env_master_key',currentKeyVersion:1 } }; });
-app.put('/v3/admin/integrations/:provider', async (request, reply) => { const claims = await requirePermission(request, reply, 'integrations:write'); if (!claims) return; const provider = asString((request.params as Json).provider); const body = asObject(request.body); const reason = asString(body.changeReason); if (!reason) return apiError(reply,422,'validation_failed','O‘zgarish sababi majburiy.'); const existing = await db.query('SELECT provider FROM integration_secrets WHERE provider=$1',[provider]); if (!existing.rows[0]) return apiError(reply,404,'not_found','Integratsiya topilmadi.'); const secret = asString(body.secretValue); const encrypted = secret ? encryptSecret(secret) : null; await db.query(`UPDATE integration_secrets SET secret_ciphertext=COALESCE($2,secret_ciphertext), secret_nonce=COALESCE($3,secret_nonce), wrapped_dek=CASE WHEN $2 IS NULL THEN wrapped_dek ELSE 'server-master'::bytea END, key_version=CASE WHEN $2 IS NULL THEN key_version ELSE 1 END, masked_hint=COALESCE($4,masked_hint), secret_fingerprint=COALESCE($5,secret_fingerprint), public_config=COALESCE($6,public_config), is_enabled=COALESCE($7,is_enabled), health=CASE WHEN COALESCE($7,is_enabled) THEN 'unknown' ELSE 'not_configured' END, last_rotated_at=CASE WHEN $2 IS NULL THEN last_rotated_at ELSE now() END, last_rotated_by=CASE WHEN $2 IS NULL THEN last_rotated_by ELSE $8 END WHERE provider=$1`, [provider,encrypted?.ciphertext ?? null,encrypted?.nonce ?? null,encrypted?.maskedHint ?? null,encrypted?.fingerprint ?? null,body.publicConfig ?? null,typeof body.isEnabled==='boolean' ? body.isEnabled : null,claims.sub]); await audit(claims,'integration.update','integration_secret',provider,reason,{ provider },request); return { integration: { provider }, auditLogId:newId() }; });
+app.get('/v3/admin/dashboard', async (request, reply) => {
+  if (!(await requirePermission(request, reply, 'dashboard:read'))) return;
+  const [counts, regions, queue, audio, words, trend] = await Promise.all([
+    db.query(`SELECT
+        count(*) FILTER (WHERE status='pending')::int AS pending,
+        count(*) FILTER (WHERE status='approved' AND resolved_at::date=current_date)::int AS approved_today,
+        count(*) FILTER (WHERE status='rejected' AND resolved_at::date=current_date)::int AS rejected_today,
+        count(*) FILTER (WHERE status='needs_clarification')::int AS clarification,
+        count(*) FILTER (WHERE ${FLAGGED_LOCATION_SQL})::int AS flagged_location
+      FROM contribution_requests`),
+    db.query('SELECT * FROM v_region_stats ORDER BY word_count DESC LIMIT 12'),
+    db.query(`${requestSql} WHERE cr.status IN ('pending','needs_clarification') ORDER BY cr.created_at DESC LIMIT 5`),
+    db.query(`SELECT
+        count(*) FILTER (WHERE moderation_status='pending' AND superseded_at IS NULL)::int AS queue,
+        count(*) FILTER (WHERE analysis_status='pending_analysis' AND superseded_at IS NULL)::int AS pending,
+        count(*) FILTER (WHERE superseded_at IS NULL)::int AS total
+      FROM audio_submissions`),
+    db.query(`SELECT count(*)::int AS n FROM words WHERE status='published'`),
+    // Oxirgi 14 kun. Bo'sh kunlar ham nol bilan qaytadi, aks holda grafik
+    // uzilib ko'rinadi.
+    db.query(`WITH days AS (
+        SELECT generate_series(current_date - interval '13 days', current_date, interval '1 day')::date AS day
+      )
+      SELECT days.day,
+        (SELECT count(*)::int FROM contribution_requests cr WHERE cr.created_at::date = days.day) AS submitted,
+        (SELECT count(*)::int FROM contribution_requests cr WHERE cr.status='approved' AND cr.resolved_at::date = days.day) AS approved,
+        (SELECT count(*)::int FROM contribution_requests cr WHERE cr.status='rejected' AND cr.resolved_at::date = days.day) AS rejected
+      FROM days ORDER BY days.day`),
+  ]);
+  const c = counts.rows[0];
+  const a = audio.rows[0];
+  return {
+    counters: {
+      pendingRequests: c.pending,
+      approvedToday: c.approved_today,
+      rejectedToday: c.rejected_today,
+      needsClarification: c.clarification,
+      audioQueue: a.queue,
+      audioPendingAnalysis: a.pending,
+      flaggedLocation: c.flagged_location,
+      totalWords: words.rows[0].n,
+      totalAudio: a.total,
+    },
+    regionStats: regions.rows.map((row) => ({ regionId: row.region_id, regionName: row.region_name, wordCount: Number(row.word_count), audioCount: Number(row.audio_count), pendingCount: Number(row.pending_count), avgDialectScore: Number(row.avg_dialect_score) })),
+    recentQueue: queue.rows.map((row) => ({ id: row.id, title: row.payload.word, subtitle: row.payload.meaning, status: row.status, score: row.validation_score, hasAudio: !!row.audio_id, flagged: !['inside', 'not_provided'].includes(String(row.submission_location_status)), createdAt: iso(row.created_at) })),
+    trend: trend.rows.map((row) => ({ date: String(row.day instanceof Date ? row.day.toISOString().slice(0, 10) : row.day), submitted: Number(row.submitted), approved: Number(row.approved), rejected: Number(row.rejected) })),
+    generatedAt: new Date().toISOString(),
+  };
+});
+
+app.get('/v3/admin/integrations', async (request, reply) => {
+  if (!(await requirePermission(request, reply, 'integrations:read'))) return;
+  const rows = await db.query(INTEGRATION_SELECT);
+  const currentKeyVersion = rows.rows.reduce((highest, row) => Math.max(highest, Number(row.key_version ?? 0)), 0);
+  return {
+    items: rows.rows.map(mapIntegration),
+    encryption: { algorithm: 'AES-256-GCM', keySource: 'env_master_key' as const, currentKeyVersion: currentKeyVersion || 1 },
+  };
+});
+
+app.put('/v3/admin/integrations/:provider', async (request, reply) => {
+  const claims = await requirePermission(request, reply, 'integrations:write');
+  if (!claims) return;
+  const provider = asString((request.params as Json).provider);
+  const body = asObject(request.body);
+  const reason = asString(body.changeReason);
+  if (!reason) return apiError(reply, 422, 'validation_failed', 'O‘zgarish sababi majburiy.');
+  const secret = asString(body.secretValue);
+  if (secret && secret.length > 8_192) return apiError(reply, 422, 'validation_failed', 'Kalit qiymati juda uzun.');
+
+  const client: PoolClient = await db.connect();
+  try {
+    await client.query('BEGIN');
+    const existing = await client.query('SELECT * FROM integration_secrets WHERE provider=$1 FOR UPDATE', [provider]);
+    const previous = existing.rows[0];
+    if (!previous) throw new RouteFault(404, 'not_found', 'Integratsiya topilmadi.');
+
+    const encrypted = secret ? encryptSecret(secret) : null;
+    if (encrypted && previous.secret_ciphertext && previous.key_version) {
+      // Rotatsiya: eski shifrmatn yo'qolmaydi, tarixga ko'chadi.
+      // Ilgari bu qadam umuman yo'q edi va eski kalit qaytarib bo'lmas
+      // tarzda ustiga yozilardi.
+      await client.query(
+        `INSERT INTO integration_secret_versions (provider, key_version, secret_ciphertext, secret_nonce, wrapped_dek, masked_hint, retired_by)
+         VALUES ($1,$2,$3,$4,COALESCE($5,'server-master'::bytea),$6,$7)
+         ON CONFLICT (provider, key_version) DO NOTHING`,
+        [provider, previous.key_version, previous.secret_ciphertext, previous.secret_nonce, previous.wrapped_dek, previous.masked_hint, claims.sub],
+      );
+    }
+
+    const updated = await client.query(
+      `UPDATE integration_secrets SET
+         secret_ciphertext = COALESCE($2, secret_ciphertext),
+         secret_nonce = COALESCE($3, secret_nonce),
+         wrapped_dek = CASE WHEN $2::bytea IS NULL THEN wrapped_dek ELSE 'server-master'::bytea END,
+         key_version = CASE WHEN $2::bytea IS NULL THEN key_version ELSE COALESCE(key_version, 0) + 1 END,
+         masked_hint = COALESCE($4, masked_hint),
+         secret_fingerprint = COALESCE($5, secret_fingerprint),
+         public_config = COALESCE($6, public_config),
+         is_enabled = COALESCE($7, is_enabled),
+         health = CASE WHEN $2::bytea IS NOT NULL THEN 'unknown'::integration_health
+                       WHEN COALESCE($7, is_enabled) THEN health
+                       ELSE 'not_configured'::integration_health END,
+         health_checked_at = CASE WHEN $2::bytea IS NULL THEN health_checked_at ELSE NULL END,
+         last_rotated_at = CASE WHEN $2::bytea IS NULL THEN last_rotated_at ELSE now() END,
+         last_rotated_by = CASE WHEN $2::bytea IS NULL THEN last_rotated_by ELSE $8 END
+       WHERE provider=$1`,
+      [provider, encrypted?.ciphertext ?? null, encrypted?.nonce ?? null, encrypted?.maskedHint ?? null, encrypted?.fingerprint ?? null, body.publicConfig ?? null, typeof body.isEnabled === 'boolean' ? body.isEnabled : null, claims.sub],
+    );
+    if (!updated.rowCount) throw new RouteFault(404, 'not_found', 'Integratsiya topilmadi.');
+
+    // Auditda kalit qiymati emas, faqat uning izi qoladi.
+    const auditLogId = await audit(claims, encrypted ? 'integration.rotate' : 'integration.update', 'integration_secret', provider, reason, {
+      provider,
+      secretValue: encrypted ? '***' : undefined,
+      maskedHint: encrypted?.maskedHint ?? previous.masked_hint ?? null,
+      isEnabled: typeof body.isEnabled === 'boolean' ? body.isEnabled : previous.is_enabled,
+    }, request, client);
+    await client.query('COMMIT');
+
+    const view = await db.query(`${INTEGRATION_SELECT} WHERE s.provider=$1`, [provider]);
+    return { integration: mapIntegration(view.rows[0]), auditLogId };
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    return failFromError(reply, error, 'integration.update');
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * Saqlangan kalit haqiqatan ishlayotganini tekshiradi. Loyiha egasi kalitni
+ * kiritgach, uni sinash uchun boshqa yo'l yo'q edi: panel doim `unknown`
+ * ko'rsatardi. Kalit qiymati bu yerda ham hech qayerga chiqmaydi.
+ */
+app.post('/v3/admin/integrations/:provider/health-check', async (request, reply) => {
+  const claims = await requirePermission(request, reply, 'integrations:write');
+  if (!claims) return;
+  const provider = asString((request.params as Json).provider);
+  const existing = await db.query('SELECT provider, is_enabled, secret_ciphertext FROM integration_secrets WHERE provider=$1', [provider]);
+  if (!existing.rows[0]) return apiError(reply, 404, 'not_found', 'Integratsiya topilmadi.');
+
+  const outcome = await checkIntegrationHealth(provider, Boolean(existing.rows[0].secret_ciphertext), Boolean(existing.rows[0].is_enabled));
+  await db.query('UPDATE integration_secrets SET health=$2::integration_health, health_checked_at=now() WHERE provider=$1', [provider, outcome.health]);
+  await audit(claims, 'integration.update', 'integration_secret', provider, 'Ulanish tekshirildi', { provider, health: outcome.health }, request);
+  const view = await db.query(`${INTEGRATION_SELECT} WHERE s.provider=$1`, [provider]);
+  return {
+    integration: mapIntegration(view.rows[0]),
+    health: outcome.health,
+    message: outcome.message,
+    checkedAt: new Date().toISOString(),
+  };
+});
 
 app.post('/v3/telemetry/app-opens', async (request, reply) => { const body=asObject(request.body); if (!asString(body.installationId)||!asString(body.appVersion)||!asString(body.openedAt)) return apiError(reply,422,'validation_failed','Hodisa ma’lumoti to‘liq emas.'); await db.query('INSERT INTO app_open_events (installation_id,app_version,location_consent,classification,region_id,opened_at) VALUES ($1,$2,$3,$4,$5,$6)',[body.installationId,body.appVersion,bool(body.locationConsent),body.classification ?? 'unknown',body.regionId ?? null,body.openedAt]); return reply.status(202).send({ accepted:true }); });
 
@@ -1057,7 +1487,12 @@ app.get('/v3/audio/:id', async (request, reply) => {
   }
 });
 
-app.setErrorHandler((error, _request, reply) => { app.log.error(error); if ((error as { code?: string }).code === 'FST_REQ_FILE_TOO_LARGE') return apiError(reply,413,'payload_too_large','Audio 8 MB dan oshmasligi kerak.'); return apiError(reply,500,'internal_error','Serverda kutilmagan xatolik yuz berdi.'); });
+app.setErrorHandler((error, request, reply) => {
+  if ((error as { code?: string }).code === 'FST_REQ_FILE_TOO_LARGE') {
+    return apiError(reply, 413, 'payload_too_large', 'Audio 8 MB dan oshmasligi kerak.');
+  }
+  return failFromError(reply, error, `unhandled:${request.method} ${request.routeOptions?.url ?? request.url}`);
+});
 
 async function startServer() {
   await pluginsReady;

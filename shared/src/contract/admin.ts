@@ -149,6 +149,15 @@ export interface IntegrationSecretView {
   /** Kalitdan tashqari, ochiq sozlamalar (model nomi, region, endpoint). */
   publicConfig: Record<string, string>;
   isEnabled: boolean;
+  /**
+   * Serverda bu provider uchun haqiqiy mijoz ulanganmi.
+   * `false` bo'lsa kalit saqlanadi, lekin hech qayerda ishlatilmaydi —
+   * panel buni ochiq ko'rsatishi kerak, aks holda egasi ishlamaydigan
+   * katakka haqiqiy kalit yozib qo'yadi.
+   */
+  isSupported?: boolean;
+  /** `POST /admin/integrations/:provider/health-check` natijasi bo'yicha izoh. */
+  healthMessage?: string | null;
 }
 
 /** GET /admin/integrations */
@@ -173,4 +182,17 @@ export interface UpdateIntegrationRequest {
 export interface UpdateIntegrationResponse {
   integration: IntegrationSecretView;
   auditLogId: Uuid;
+}
+
+/**
+ * POST /admin/integrations/:provider/health-check
+ *
+ * Saqlangan kalit bilan provider'ga eng arzon so'rov yuboradi. Kalit qiymati
+ * javobda ham, auditda ham qaytmaydi — faqat holat va qisqa izoh.
+ */
+export interface IntegrationHealthCheckResponse {
+  integration: IntegrationSecretView;
+  health: IntegrationHealth;
+  message: string;
+  checkedAt: IsoDateTime;
 }

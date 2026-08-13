@@ -1,4 +1,4 @@
-import { readFile } from 'node:fs/promises';
+import { readdir, readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import dotenv from 'dotenv';
 import { Pool } from 'pg';
@@ -8,15 +8,19 @@ dotenv.config({ path: process.env.API_ENV_FILE ?? '.env' });
 const databaseUrl = process.env.DATABASE_URL;
 if (!databaseUrl) throw new Error('DATABASE_URL muhit o‘zgaruvchisi kiritilmagan.');
 
-const migrations = [
-  '0001_core_schema.sql',
-  '0002_seed_reference_data.sql',
-  '0004_app_open_events.sql',
-  '0005_community_interactions.sql',
-  '0006_audio_idempotency.sql',
-  '0007_audio_hardening.sql',
-  '0008_region_suggestions.sql',
-];
+/**
+ * Migratsiyalar papkadan o'qiladi va nom bo'yicha tartiblanadi.
+ *
+ * Ilgari ro'yxat qo'lda yozilardi: yangi fayl qo'shilib, ro'yxatga
+ * kiritilmasa, u jimgina o'tkazib yuborilardi va nosozlik faqat productionda
+ * ko'rinardi.
+ */
+async function migrationFiles(root: string): Promise<string[]> {
+  const entries = await readdir(root);
+  return entries
+    .filter((name) => name.endsWith('.sql'))
+    .sort((left, right) => left.localeCompare(right, 'en'));
+}
 
 const db = new Pool({
   connectionString: databaseUrl,
@@ -33,6 +37,8 @@ try {
   `);
 
   const root = resolve(process.cwd(), 'db/migrations');
+  const migrations = await migrationFiles(root);
+  if (!migrations.length) throw new Error('Migratsiya fayllari topilmadi.');
   for (const name of migrations) {
     const alreadyApplied = await db.query('SELECT 1 FROM schema_migrations WHERE name = $1', [name]);
     if (alreadyApplied.rowCount) {

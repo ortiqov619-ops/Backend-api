@@ -2,11 +2,18 @@ import type {
   AuditLogQuery,
   AuditLogResponse,
   DashboardResponse,
+  IntegrationHealthCheckResponse,
   IntegrationListResponse,
   IntegrationProvider,
   UpdateIntegrationRequest,
   UpdateIntegrationResponse,
 } from '../contract/admin';
+import type {
+  AudioModerationDecisionRequest,
+  AudioModerationDecisionResponse,
+  AudioModerationListResponse,
+  AudioModerationQuery,
+} from '../contract/audio';
 import type { AdminLoginRequest, AdminLoginResponse, RefreshRequest, RefreshResponse } from '../contract/auth';
 import type { Uuid } from '../contract/common';
 import type {
@@ -23,6 +30,8 @@ import type { CreateRegionRequest, RegionListQuery, RegionListResponse, RegionMu
 import type {
   ArchiveWordRequest,
   ArchiveWordResponse,
+  CreateAdminWordRequest,
+  CreateAdminWordResponse,
   UpdateWordRequest,
   UpdateWordResponse,
   Word,
@@ -80,6 +89,10 @@ export class XorazmApiClient {
     return this.http.request('GET', `/words/${id}`, { auth: false });
   }
 
+  createAdminWord(body: CreateAdminWordRequest): Promise<CreateAdminWordResponse> {
+    return this.http.request('POST', '/admin/words', { body });
+  }
+
   updateWord(id: Uuid, body: UpdateWordRequest): Promise<UpdateWordResponse> {
     return this.http.request('PATCH', `/words/${id}`, { body });
   }
@@ -119,6 +132,17 @@ export class XorazmApiClient {
     return this.http.request('PATCH', `/requests/${id}/status`, { body });
   }
 
+  /* ------------------------- audio moderation ------------------------ */
+
+  listAudioModeration(query?: AudioModerationQuery): Promise<AudioModerationListResponse> {
+    return this.http.request('GET', '/audio/moderation', { query: toQuery(query) });
+  }
+
+  /** Faqat audio yozuvini o'zgartiradi: so'rov statusi va lug'at tegilmaydi. */
+  decideAudio(id: Uuid, body: AudioModerationDecisionRequest): Promise<AudioModerationDecisionResponse> {
+    return this.http.request('PATCH', `/audio/${id}/moderation`, { body });
+  }
+
   /* ------------------------------ admin ------------------------------ */
 
   dashboard(): Promise<DashboardResponse> {
@@ -151,5 +175,10 @@ export class XorazmApiClient {
 
   updateIntegration(provider: IntegrationProvider, body: UpdateIntegrationRequest): Promise<UpdateIntegrationResponse> {
     return this.http.request('PUT', `/admin/integrations/${provider}`, { body });
+  }
+
+  /** Saqlangan kalitni provider'da sinaydi. Kalit qiymati uzatilmaydi. */
+  checkIntegration(provider: IntegrationProvider): Promise<IntegrationHealthCheckResponse> {
+    return this.http.request('POST', `/admin/integrations/${provider}/health-check`, {});
   }
 }

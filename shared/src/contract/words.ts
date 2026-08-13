@@ -63,6 +63,25 @@ export interface WordListQuery extends PageQuery {
 
 export type WordListResponse = Paginated<Word>;
 
+/** POST /admin/words — administratorning bevosita lug‘at yozuvi. */
+export interface CreateAdminWordRequest {
+  word: string;
+  meaning: string;
+  literaryForm?: string | null;
+  example?: string | null;
+  category?: string | null;
+  regionId?: Uuid | null;
+  districtId?: Uuid | null;
+  dialectId?: Uuid | null;
+  /** Audit uchun majburiy: nima sababdan bevosita kiritildi. */
+  changeReason: string;
+}
+
+export interface CreateAdminWordResponse {
+  word: Word;
+  auditLogId: Uuid;
+}
+
 /** PATCH /words/:id */
 export interface UpdateWordRequest {
   word?: string;
