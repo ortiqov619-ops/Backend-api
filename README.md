@@ -43,3 +43,25 @@ npm run migrate
 npm run seed:admin
 npm run dev
 ```
+
+## Ro‘yxatda yo‘q hudud taklifi
+
+Mobil ilova foydalanuvchisi ro‘yxatda hududini topmasa, so‘z taklifining
+`payload.proposedRegion` maydonini yuboradi:
+
+```json
+{
+  "nameUz": "Pitnak shahri",
+  "level": "district",
+  "parentRegionId": "00000000-0000-4000-8000-000000000001"
+}
+```
+
+Bu qiymat xavfsizlik sababli `regions` jadvaliga avtomatik qo‘shilmaydi.
+Administrator uni so‘rov moderatsiyasida ko‘radi va tasdiqlashdan oldin
+`overrides.regionId` hamda, kerak bo‘lsa, `overrides.districtId` orqali mavjud
+rasmiy hududga bog‘laydi. Explicit bog‘lashsiz proposal tasdiqlanmaydi.
+Foydalanuvchi taklif qilgan nom manba so‘rovining audit payloadida saqlanadi,
+ammo nashr qilinadigan `words` yozuviga faqat administrator tanlagan canonical
+UUIDlar tushadi. Moderatsiya qarori, Word yaratish va audit bitta PostgreSQL
+tranzaksiyasida bajariladi.

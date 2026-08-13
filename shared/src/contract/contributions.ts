@@ -7,6 +7,13 @@ export type ContributionType = 'word' | 'audio' | 'correction';
 
 export type ModerationStatus = 'pending' | 'approved' | 'rejected' | 'needs_clarification';
 
+/** Ro‘yxatda yo‘q hudud: rasmiy katalogga faqat moderator/admin tasdig‘idan keyin qo‘shiladi. */
+export interface ProposedRegion {
+  nameUz: string;
+  level: 'district' | 'village' | 'neighborhood';
+  parentRegionId?: Uuid;
+}
+
 /** So'z/izoh uchun foydalanuvchi kiritgan mazmun. */
 export interface ContributionPayload {
   word: string;
@@ -21,6 +28,7 @@ export interface ContributionPayload {
   districtId?: Uuid;
   villageId?: Uuid;
   neighborhood?: string;
+  proposedRegion?: ProposedRegion;
 }
 
 /** Qurilma haqidagi minimal, anonim ma'lumot — spam/spoof tahlili uchun. */
@@ -117,6 +125,8 @@ export interface RequestListQuery extends PageQuery {
   verdict?: ValidationVerdict;
   locationStatus?: SubmissionLocationStatus;
   hasAudio?: boolean;
+  /** `true` — ro‘yxatda bo‘lmagan hudud nomi ham taklif qilingan so‘rovlar. */
+  hasRegionSuggestion?: boolean;
   /** `true` — faqat shubhali (spoof/near-boundary/past skor) so'rovlar. */
   flaggedOnly?: boolean;
   search?: string;

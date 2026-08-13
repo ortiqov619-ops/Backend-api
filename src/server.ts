@@ -10,6 +10,16 @@ import { AUDIO_LIMITS, evaluateLocationGate, phoneticKey, validateContributionTe
 import { fixedWindow, normalizeExpectedText, sameAudioFingerprint, type AudioIdempotencyFingerprint } from './audio-hardening';
 import { assertProductionConfig, config } from './config';
 import {
+  canBeChildOf,
+  canCreateRegionUnder,
+  isDirectVillageChild,
+  uniqueDialectIdByLabel,
+  normalizeRegionName,
+  parseRegionSuggestion,
+  resolveRegionForPublication,
+  RegionSuggestionValidationError,
+} from './region-suggestion';
+import {
   decryptSecret,
   encryptSecret,
   hashToken,
@@ -71,6 +81,7 @@ async function enforceRateLimit(
   scope: string,
   limit: number,
   windowSeconds: number,
+  message = 'Juda ko‘p so‘rov yuborildi. Biroz kutib qayta urinib ko‘ring.',
 ): Promise<boolean> {
   const { windowStartMs, resetAtMs } = fixedWindow(Date.now(), windowSeconds);
   // IP manzilni ochiq saqlamaymiz. `trustProxy` faqat hosting proxylarida
@@ -98,7 +109,7 @@ async function enforceRateLimit(
 
   if (count <= limit) return true;
   reply.header('Retry-After', String(Math.max(1, Math.ceil((resetAtMs - Date.now()) / 1_000))));
-  apiError(reply, 429, 'rate_limited', 'Juda ko‘p audio so‘rovi yuborildi. Biroz kutib qayta urinib ko‘ring.');
+  apiError(reply, 429, 'rate_limited', message);
   return false;
 }
 
@@ -119,10 +130,11 @@ async function requirePermission(request: FastifyRequest, reply: FastifyReply, p
   }
   return claims;
 }
-async function audit(actor: Claims | null, action: string, entityType: string, entityId: string | null, reason: string | null, after: Json | null, request: FastifyRequest) {
-  const actorName = actor ? (await db.query<{ full_name: string }>('SELECT full_name FROM users WHERE id = $1', [actor.sub])).rows[0]?.full_name ?? 'Administrator' : 'Tizim';
+async function audit(actor: Claims | null, action: string, entityType: string, entityId: string | null, reason: string | null, after: Json | null, request: FastifyRequest, transaction?: PoolClient) {
+  const executor = transaction ?? db;
+  const actorName = actor ? (await executor.query<{ full_name: string }>('SELECT full_name FROM users WHERE id = $1', [actor.sub])).rows[0]?.full_name ?? 'Administrator' : 'Tizim';
   const auditLogId = newId();
-  await db.query(
+  await executor.query(
     `INSERT INTO audit_logs (action, entity_type, entity_id, actor_id, actor_name, actor_roles, ip_address, user_agent, after_data, reason, request_id)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
     [action, entityType, entityId, actor?.sub ?? null, actorName, actor?.roles ?? [], request.ip ?? null, request.headers['user-agent'] ?? null, after, reason, auditLogId],
@@ -143,6 +155,130 @@ function mapWord(row: QueryResultRow) {
   return { id: row.id, word: row.word, literaryForm: row.literary_form, meaning: row.meaning, example: row.example, category: row.category, phoneticKey: row.phonetic_key, status: row.status, regionId: row.region_id, districtId: row.district_id, villageId: row.village_id, dialectId: row.dialect_id, clan: row.clan, dialectScore: row.dialect_score, sourceRequestId: row.source_request_id, archivedAt: iso(row.archived_at), archiveReason: row.archive_reason, createdAt: iso(row.created_at), updatedAt: iso(row.updated_at) };
 }
 async function activeFences() { const result = await db.query('SELECT * FROM geofences WHERE is_active = true'); return result.rows.map(mapFence); }
+
+async function payloadForPublication(source: Json, overrides: Json, client: PoolClient): Promise<{ payload: Json; regionResolution: Json | null; dialectResolution: Json | null }> {
+  const payload = { ...source, ...overrides };
+  const sourceProposal = source.proposedRegion;
+  const regionId = asString(payload.regionId) || '00000000-0000-4000-8000-000000000001';
+  if (!isUuid(regionId)) throw new RouteFault(422, 'validation_failed', 'So‘z hududi noto‘g‘ri.');
+  const region = await client.query('SELECT id, level, is_contribution_allowed FROM regions WHERE id=$1', [regionId]);
+  if (!region.rows[0] || region.rows[0].level !== 'region' || !region.rows[0].is_contribution_allowed) {
+    throw new RouteFault(422, 'validation_failed', 'So‘z uchun tanlangan viloyat hissa qabul qilmaydi.');
+  }
+  payload.regionId = regionId;
+
+  let proposal: ReturnType<typeof parseRegionSuggestion> = null;
+  try {
+    proposal = parseRegionSuggestion(sourceProposal, regionId);
+  } catch (error) {
+    if (error instanceof RegionSuggestionValidationError) throw new RouteFault(422, 'validation_failed', error.message);
+    throw error;
+  }
+
+  let regionResolution: Json | null = null;
+  if (proposal) {
+    if (!Object.prototype.hasOwnProperty.call(overrides, 'regionId')) {
+      throw new RouteFault(422, 'validation_failed', 'Yangi hudud taklifini tasdiqlashdan oldin rasmiy hududga bog‘lang.');
+    }
+    const parent = await client.query('SELECT id, name_uz, parent_id, level, is_contribution_allowed FROM regions WHERE id=$1', [proposal.parentRegionId]);
+    if (!parent.rows[0] || !parent.rows[0].is_contribution_allowed || !canBeChildOf(proposal.level, String(parent.rows[0].level))) {
+      throw new RouteFault(422, 'validation_failed', 'Taklif qilingan hududning yuqori hududi endi yaroqli emas.');
+    }
+    const belongs = await client.query(`WITH RECURSIVE lineage AS (
+      SELECT id, parent_id FROM regions WHERE id=$1
+      UNION ALL
+      SELECT r.id, r.parent_id FROM regions r JOIN lineage l ON l.parent_id=r.id
+    ) SELECT 1 FROM lineage WHERE id=$2 LIMIT 1`, [proposal.parentRegionId, regionId]);
+    if (!belongs.rows[0]) throw new RouteFault(422, 'validation_failed', 'Taklif qilingan hudud viloyatga mos emas.');
+
+    // Admin UI faqat ikki xavfsiz qaror yuboradi: Xorazm umumiy yoki
+    // mavjud kanonik tuman. Manba proposalini payloadda saqlab qolamiz,
+    // ammo Word uchun faqat explicit override ishlatiladi.
+    const explicitDistrictId = asString(overrides.districtId) || null;
+    const explicitVillageId = asString(overrides.villageId) || null;
+    const explicitNeighborhood = asString(overrides.neighborhood) || null;
+    if (explicitVillageId) {
+      const village = await client.query('SELECT level::text, parent_id FROM regions WHERE id=$1 AND is_contribution_allowed=true', [explicitVillageId]);
+      const row = village.rows[0];
+      if (!isDirectVillageChild(row ? { level: String(row.level), parentId: nullableString(row.parent_id) } : null, explicitDistrictId)) {
+        throw new RouteFault(422, 'validation_failed', 'Moderator tanlagan qishloq aynan tanlangan tumanga tegishli bo‘lishi kerak.');
+      }
+    }
+    const resolved = resolveRegionForPublication(proposal, {
+      districtId: explicitDistrictId,
+      villageId: explicitVillageId,
+      neighborhood: explicitNeighborhood,
+    });
+    payload.districtId = resolved.districtId ?? undefined;
+    payload.villageId = resolved.villageId ?? undefined;
+    payload.neighborhood = resolved.neighborhood ?? undefined;
+    delete payload.proposedRegion;
+    regionResolution = {
+      resolution: resolved.resolution,
+      proposedNameUz: proposal.nameUz,
+      proposedLevel: proposal.level,
+      matchedRegionId: resolved.matchedRegionId,
+      publishedDistrictId: resolved.districtId,
+      publishedVillageId: resolved.villageId,
+      publishedNeighborhood: resolved.neighborhood,
+    };
+  }
+  // `words` jadvali faqat canonical ustunlarni oladi. Proposal faqat manba
+  // contribution payloadida audit uchun qoladi.
+  delete payload.proposedRegion;
+
+  for (const [field, expectedLevel] of [['districtId', 'district'], ['villageId', 'village']] as const) {
+    const selectedId = asString(payload[field]);
+    if (!selectedId) {
+      delete payload[field];
+      continue;
+    }
+    if (!isUuid(selectedId)) throw new RouteFault(422, 'validation_failed', 'So‘zning hudud identifikatori noto‘g‘ri.');
+    const canonical = await client.query(`WITH RECURSIVE lineage AS (
+      SELECT id, parent_id, level, is_contribution_allowed FROM regions WHERE id=$1
+      UNION ALL
+      SELECT r.id, r.parent_id, r.level, r.is_contribution_allowed FROM regions r JOIN lineage l ON l.parent_id=r.id
+    ) SELECT
+      EXISTS(SELECT 1 FROM lineage WHERE id=$2) AS belongs_to_region,
+      (SELECT level::text FROM lineage WHERE id=$1) AS selected_level,
+      (SELECT is_contribution_allowed FROM lineage WHERE id=$1) AS contribution_allowed`, [selectedId, regionId]);
+    const selected = canonical.rows[0];
+    if (!selected?.belongs_to_region || selected.selected_level !== expectedLevel || !selected.contribution_allowed) {
+      throw new RouteFault(422, 'validation_failed', 'So‘zning rasmiy tuman/qishloq tanlovi yaroqli emas.');
+    }
+  }
+  const publishedDistrictId = asString(payload.districtId) || null;
+  const publishedVillageId = asString(payload.villageId) || null;
+  if (publishedVillageId) {
+    const village = await client.query('SELECT level::text, parent_id FROM regions WHERE id=$1 AND is_contribution_allowed=true', [publishedVillageId]);
+    const row = village.rows[0];
+    if (!isDirectVillageChild(row ? { level: String(row.level), parentId: nullableString(row.parent_id) } : null, publishedDistrictId)) {
+      throw new RouteFault(422, 'validation_failed', 'Tanlangan qishloq aynan tanlangan tumanga tegishli bo‘lishi kerak.');
+    }
+  }
+
+  let dialectResolution: Json | null = null;
+  const requestedDialect = asString(payload.dialectId);
+  if (requestedDialect) {
+    if (isUuid(requestedDialect)) {
+      const canonicalDialect = await client.query('SELECT id FROM dialects WHERE id=$1 AND is_active=true', [requestedDialect]);
+      if (!canonicalDialect.rows[0]) {
+        delete payload.dialectId;
+        dialectResolution = { source: requestedDialect, resolution: 'dropped_inactive_or_unknown', canonicalId: null };
+      }
+    } else {
+      const dialects = await client.query('SELECT id, code, name_uz FROM dialects WHERE is_active=true');
+      const canonicalId = uniqueDialectIdByLabel(requestedDialect, dialects.rows.map((row) => ({ id: String(row.id), code: String(row.code), nameUz: String(row.name_uz) })));
+      if (canonicalId) payload.dialectId = canonicalId;
+      else delete payload.dialectId;
+      dialectResolution = { source: requestedDialect, resolution: canonicalId ? 'legacy_label_mapped' : 'dropped_unknown_label', canonicalId };
+    }
+  } else {
+    delete payload.dialectId;
+  }
+
+  return { payload, regionResolution, dialectResolution };
+}
 
 /** Mobil GPS uchun juda qat'iy boshlang'ich siyosat amalda hissa oqimini
  * to'xtatib qo'yar edi. Bu yerda pastroq aniqlik qabul qilinadi, lekin u
@@ -376,7 +512,15 @@ app.post('/v3/admin/regions', async (request, reply) => {
   const level = asString(body.level) || 'region';
   if (!nameUz || !code || !reason) return apiError(reply, 422, 'validation_failed', 'Hudud nomi, kodi va o‘zgarish sababi majburiy.');
   if (!['region','district','village','neighborhood'].includes(level)) return apiError(reply, 422, 'validation_failed', 'Hudud darajasi noto‘g‘ri.');
-  const parentId = body.parentId ?? (level === 'region' ? '00000000-0000-4000-8000-000000000000' : null);
+  const parentId = asString(body.parentId) || (level === 'region' ? '00000000-0000-4000-8000-000000000000' : '');
+  if (!isUuid(parentId)) return apiError(reply, 422, 'validation_failed', 'Yuqori hududni tanlash majburiy.');
+  const parent = await db.query('SELECT id, level::text, is_contribution_allowed FROM regions WHERE id=$1', [parentId]);
+  if (!parent.rows[0] || !canCreateRegionUnder(level as 'region' | 'district' | 'village' | 'neighborhood', String(parent.rows[0].level))) {
+    return apiError(reply, 422, 'validation_failed', 'Yangi hudud darajasi tanlangan yuqori hududga mos emas.');
+  }
+  if (level !== 'region' && !parent.rows[0].is_contribution_allowed) {
+    return apiError(reply, 422, 'validation_failed', 'Yopiq yuqori hudud ostida hissa hududi yaratib bo‘lmaydi.');
+  }
   try {
     const created = await db.query(`INSERT INTO regions (code,name_uz,parent_id,level,is_contribution_allowed,sort_order,created_by,updated_by)
       VALUES ($1,$2,$3,$4,false,COALESCE((SELECT max(sort_order)+1 FROM regions),1),$5,$5) RETURNING *`, [code,nameUz,parentId,level,claims.sub]);
@@ -429,6 +573,7 @@ app.post('/v3/admin/words', async (request, reply) => {
 });
 
 app.post('/v3/contributions/words', async (request, reply) => {
+  if (!(await enforceRateLimit(request, reply, 'word-contribution', 20, 15 * 60))) return;
   const body = asObject(request.body); const payload = asObject(body.payload); const location = asObject(body.location); const device = asObject(body.device); const key = asString(body.idempotencyKey);
   if (!asString(payload.word) || !asString(payload.meaning) || !key) return apiError(reply, 422, 'validation_failed', 'So‘z, ma’no va idempotency kaliti majburiy.');
   const existing = await db.query(`${requestSql} WHERE cr.idempotency_key=$1`, [key]); if (existing.rows[0]) return { request: await mapRequest(existing.rows[0]), userMessage: 'Avvalgi so‘rov qaytarildi.' };
@@ -438,9 +583,114 @@ app.post('/v3/contributions/words', async (request, reply) => {
   // GPS hissa yuborish sharti emas. Hudud foydalanuvchi tanlovi va admin
   // moderatsiyasi bilan belgilanadi; mavjud koordinata faqat ixtiyoriy auditdir.
   const requestedRegionId = asString(payload.regionId) || '00000000-0000-4000-8000-000000000001';
-  const allowedRegion = await db.query('SELECT id FROM regions WHERE id=$1 AND is_contribution_allowed=true', [requestedRegionId]);
+  if (!isUuid(requestedRegionId)) return apiError(reply, 422, 'validation_failed', 'Tanlangan viloyat identifikatori noto‘g‘ri.', { 'payload.regionId': ['Rasmiy hududni qayta tanlang.'] });
+  const allowedRegion = await db.query('SELECT id, level FROM regions WHERE id=$1 AND is_contribution_allowed=true', [requestedRegionId]);
   if (!allowedRegion.rows[0]) return apiError(reply, 422, 'validation_failed', 'Tanlangan hudud uchun hissa qabul qilish admin tomonidan yoqilmagan.');
   payload.regionId = requestedRegionId;
+
+  let proposedRegion: ReturnType<typeof parseRegionSuggestion> = null;
+  try {
+    proposedRegion = parseRegionSuggestion(payload.proposedRegion, requestedRegionId);
+  } catch (error) {
+    if (error instanceof RegionSuggestionValidationError) {
+      return apiError(reply, 422, 'validation_failed', error.message, { [error.field]: [error.message] });
+    }
+    throw error;
+  }
+
+  if (proposedRegion) {
+    const conflictField = proposedRegion.level === 'district'
+      ? 'districtId'
+      : proposedRegion.level === 'village'
+        ? 'villageId'
+        : 'neighborhood';
+    if (asString(payload[conflictField])) {
+      return apiError(reply, 422, 'validation_failed', 'Rasmiy hudud va “Boshqa” hududni bir vaqtda tanlab bo‘lmaydi.', {
+        [`payload.${conflictField}`]: ['Bittasini tanlang.'],
+        'payload.proposedRegion': ['Bittasini tanlang.'],
+      });
+    }
+
+    const parent = await db.query('SELECT id, parent_id, level, is_contribution_allowed FROM regions WHERE id=$1', [proposedRegion.parentRegionId]);
+    if (!parent.rows[0] || !parent.rows[0].is_contribution_allowed) {
+      return apiError(reply, 422, 'validation_failed', 'Boshqa hudud uchun tanlangan yuqori hudud hissa qabul qilmaydi.', {
+        'payload.proposedRegion.parentRegionId': ['Yuqori hududni qayta tanlang.'],
+      });
+    }
+    if (!canBeChildOf(proposedRegion.level, String(parent.rows[0].level))) {
+      return apiError(reply, 422, 'validation_failed', 'Boshqa hudud darajasi tanlangan yuqori hududga mos emas.', {
+        'payload.proposedRegion.level': ['Hudud turini qayta tanlang.'],
+      });
+    }
+
+    const lineage = await db.query(`WITH RECURSIVE lineage AS (
+      SELECT id, parent_id FROM regions WHERE id=$1
+      UNION ALL
+      SELECT r.id, r.parent_id FROM regions r JOIN lineage l ON l.parent_id=r.id
+    ) SELECT 1 FROM lineage WHERE id=$2 LIMIT 1`, [proposedRegion.parentRegionId, requestedRegionId]);
+    if (!lineage.rows[0]) {
+      return apiError(reply, 422, 'validation_failed', 'Boshqa hudud tanlangan viloyat tarkibiga kirmaydi.', {
+        'payload.proposedRegion.parentRegionId': ['Mos yuqori hududni tanlang.'],
+      });
+    }
+    if (proposedRegion.level === 'village' && asString(payload.districtId) !== proposedRegion.parentRegionId) {
+      return apiError(reply, 422, 'validation_failed', 'Boshqa qishloq uchun uning tumani ham tanlanishi kerak.', {
+        'payload.proposedRegion.parentRegionId': ['Tanlangan tuman bilan bir xil bo‘lishi kerak.'],
+        'payload.districtId': ['Qishloqning tumanini tanlang.'],
+      });
+    }
+    if (proposedRegion.level === 'neighborhood') {
+      const expectedParent = String(parent.rows[0].level) === 'village'
+        ? asString(payload.villageId)
+        : asString(payload.districtId);
+      if (expectedParent !== proposedRegion.parentRegionId) {
+        return apiError(reply, 422, 'validation_failed', 'Boshqa mahalla uchun uning yuqori hududi ham tanlanishi kerak.', {
+          'payload.proposedRegion.parentRegionId': ['Tanlangan yuqori hudud bilan bir xil bo‘lishi kerak.'],
+        });
+      }
+    }
+
+    const siblings = await db.query('SELECT id, name_uz FROM regions WHERE parent_id=$1 AND level=$2', [proposedRegion.parentRegionId, proposedRegion.level]);
+    const existingRegion = siblings.rows.find((row) => normalizeRegionName(String(row.name_uz)) === normalizeRegionName(proposedRegion!.nameUz));
+    if (existingRegion) {
+      return apiError(reply, 409, 'conflict', 'Bu hudud ro‘yxatda mavjud. “Boshqa” o‘rniga ro‘yxatdan tanlang.', {
+        'payload.proposedRegion.nameUz': ['Mavjud hududni tanlang.'],
+      });
+    }
+    payload.proposedRegion = proposedRegion;
+  } else {
+    delete payload.proposedRegion;
+  }
+
+  for (const [field, expectedLevel] of [['districtId', 'district'], ['villageId', 'village']] as const) {
+    const selectedId = asString(payload[field]);
+    if (!selectedId) continue;
+    if (!isUuid(selectedId)) return apiError(reply, 422, 'validation_failed', 'Tanlangan hudud identifikatori noto‘g‘ri.', { [`payload.${field}`]: ['Hududni qayta tanlang.'] });
+    const selected = await db.query(`WITH RECURSIVE lineage AS (
+      SELECT id, parent_id, level, is_contribution_allowed FROM regions WHERE id=$1
+      UNION ALL
+      SELECT r.id, r.parent_id, r.level, r.is_contribution_allowed FROM regions r JOIN lineage l ON l.parent_id=r.id
+    ) SELECT
+      EXISTS(SELECT 1 FROM lineage WHERE id=$2) AS belongs_to_region,
+      (SELECT level::text FROM lineage WHERE id=$1) AS selected_level,
+      (SELECT is_contribution_allowed FROM lineage WHERE id=$1) AS contribution_allowed`, [selectedId, requestedRegionId]);
+    const selection = selected.rows[0];
+    if (!selection?.belongs_to_region || selection.selected_level !== expectedLevel || !selection.contribution_allowed) {
+      return apiError(reply, 422, 'validation_failed', 'Tanlangan tuman/qishloq viloyatga mos emas yoki hissa uchun yopiq.', { [`payload.${field}`]: ['Hududni qayta tanlang.'] });
+    }
+  }
+  const selectedDistrictId = asString(payload.districtId) || null;
+  const selectedVillageId = asString(payload.villageId) || null;
+  if (selectedVillageId) {
+    const village = await db.query('SELECT level::text, parent_id FROM regions WHERE id=$1 AND is_contribution_allowed=true', [selectedVillageId]);
+    const row = village.rows[0];
+    if (!isDirectVillageChild(row ? { level: String(row.level), parentId: nullableString(row.parent_id) } : null, selectedDistrictId)) {
+      return apiError(reply, 422, 'validation_failed', 'Tanlangan qishloq aynan tanlangan tumanga tegishli bo‘lishi kerak.', {
+        'payload.villageId': ['Mos qishloqni tanlang.'],
+        'payload.districtId': ['Qishloqning tumanini tanlang.'],
+      });
+    }
+  }
   const duplicates = await db.query('SELECT id, word, phonetic_key FROM words WHERE status <> \'archived\'');
   const validation = validateContributionText({ payload: payload as never, locationGate: null, duplicateCandidates: duplicates.rows.map((row) => ({ id: row.id, word: row.word, phoneticKey: row.phonetic_key })), origin: 'server', thresholds: { rejectBelow:0, autoQueueAbove:65, minConfidenceForVerdict:0.5 } });
   if (validation.verdict === 'rejected') return apiError(reply, 422, 'validation_failed', 'So‘z avtomatik tekshiruvdan o‘tmadi.');
@@ -448,7 +698,12 @@ app.post('/v3/contributions/words', async (request, reply) => {
     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id`, [payload, { ...device, heritageDeclaration }, key, hasLocation ? location.latitude : null, hasLocation ? location.longitude : null, hasLocation ? location.accuracy : null, hasLocation ? location.capturedAt : null, hasLocation ? gate?.status ?? 'not_provided' : 'not_provided', gate?.matchedGeofenceId ?? null, geofences.find((f) => f.id === gate?.matchedGeofenceId)?.version ?? null, gate?.distanceToBoundaryM ?? null, hasLocation ? location.isMocked ?? null : null, validation.verdict, validation.score, true]);
   const requestId = created.rows[0].id;
   await db.query('INSERT INTO validation_results (contribution_request_id, subject, verdict, score, confidence, reasons, engine_kind, engine_name, engine_version, origin, geofence_version) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)', [requestId, validation.subject, validation.verdict, validation.score, validation.confidence, validation.reasons, validation.engine.kind, validation.engine.name, validation.engine.version, validation.origin, geofences.find((f) => f.id === gate?.matchedGeofenceId)?.version ?? null]);
-  const record = await db.query(`${requestSql} WHERE cr.id=$1`, [requestId]); return { request: await mapRequest(record.rows[0]), userMessage: 'So‘zingiz moderatorlar tekshiruviga yuborildi.' };
+  const record = await db.query(`${requestSql} WHERE cr.id=$1`, [requestId]); return {
+    request: await mapRequest(record.rows[0]),
+    userMessage: proposedRegion
+      ? 'So‘zingiz va yangi hudud taklifingiz moderatorlar tekshiruviga yuborildi.'
+      : 'So‘zingiz moderatorlar tekshiruviga yuborildi.',
+  };
 });
 
 app.post('/v3/audio/transcriptions', async (request, reply) => {
@@ -594,11 +849,16 @@ app.get('/v3/requests', async (request, reply) => {
   if (!(await requirePermission(request, reply, 'requests:read'))) return;
   const query = request.query as Json; const params: unknown[] = []; const where: string[] = [];
   for (const [input, column] of [['status','cr.status'],['type','cr.type'],['verdict','cr.validation_verdict'],['locationStatus','cr.submission_location_status']] as const) if (query[input]) { params.push(query[input]); where.push(`${column}=$${params.length}`); }
-  if (query.search) { params.push(`%${asString(query.search)}%`); where.push(`(cr.payload->>'word' ILIKE $${params.length} OR cr.payload->>'meaning' ILIKE $${params.length})`); }
+  if (query.search) { params.push(`%${asString(query.search)}%`); where.push(`(cr.payload->>'word' ILIKE $${params.length} OR cr.payload->>'meaning' ILIKE $${params.length} OR cr.payload#>>'{proposedRegion,nameUz}' ILIKE $${params.length})`); }
   if (query.hasAudio !== undefined) {
     const hasAudio = String(query.hasAudio).toLowerCase();
     if (hasAudio !== 'true' && hasAudio !== 'false') return apiError(reply, 422, 'validation_failed', 'hasAudio true yoki false bo‘lishi kerak.');
     where.push(`${hasAudio === 'false' ? 'NOT ' : ''}EXISTS (SELECT 1 FROM audio_submissions filter_audio WHERE filter_audio.contribution_request_id=cr.id)`);
+  }
+  if (query.hasRegionSuggestion !== undefined) {
+    const hasRegionSuggestion = String(query.hasRegionSuggestion).toLowerCase();
+    if (hasRegionSuggestion !== 'true' && hasRegionSuggestion !== 'false') return apiError(reply, 422, 'validation_failed', 'hasRegionSuggestion true yoki false bo‘lishi kerak.');
+    where.push(`${hasRegionSuggestion === 'false' ? 'NOT ' : ''}(cr.payload ? 'proposedRegion')`);
   }
   const current = page(query.page); const size = pageSize(query.pageSize); const count = await db.query(`SELECT count(*)::int AS total FROM contribution_requests cr ${where.length ? `WHERE ${where.join(' AND ')}` : ''}`, params); params.push(size, (current - 1) * size);
   const rows = await db.query(`${requestSql} ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY cr.created_at DESC LIMIT $${params.length - 1} OFFSET $${params.length}`, params); const total = count.rows[0].total;
@@ -607,15 +867,60 @@ app.get('/v3/requests', async (request, reply) => {
 
 app.patch('/v3/requests/:id/status', async (request, reply) => {
   const claims = await requirePermission(request, reply, 'requests:moderate'); if (!claims) return;
-  const body = asObject(request.body); const id = asString((request.params as Json).id); const current = await db.query(`${requestSql} WHERE cr.id=$1`, [id]); if (!current.rows[0]) return apiError(reply, 404, 'not_found', 'So‘rov topilmadi.');
-  const previous = current.rows[0]; if (asString(body.expectedUpdatedAt) !== iso(previous.updated_at)) return apiError(reply, 409, 'conflict', 'So‘rov boshqa moderator tomonidan yangilangan.');
-  const status = asString(body.status); const reason = asString(body.reason); if (!['approved','rejected','needs_clarification'].includes(status) || (status !== 'approved' && !reason)) return apiError(reply, 422, 'validation_failed', 'Qaror va zarur bo‘lsa sababi kiritilishi shart.');
-  const payload = { ...asObject(previous.payload), ...asObject(body.overrides) }; let wordId: string | null = null;
-  if (status === 'approved') { const createdWord = await db.query(`INSERT INTO words (word, literary_form, meaning, example, category, phonetic_key, status, region_id, district_id, village_id, dialect_id, clan, dialect_score, source_request_id) VALUES ($1,$2,$3,$4,$5,$6,'published',$7,$8,$9,$10,$11,$12,$13) RETURNING id`, [payload.word, payload.literaryForm ?? null, payload.meaning, payload.example ?? null, payload.category ?? null, phoneticKey(String(payload.word)), payload.regionId ?? null, payload.districtId ?? null, payload.villageId ?? null, payload.dialectId ?? null, payload.clan ?? null, previous.validation_score, id]); wordId = createdWord.rows[0].id; }
-  await db.query(`UPDATE contribution_requests SET status=$2, payload=$3, clarification_note=$4, resolved_at=CASE WHEN $2='needs_clarification' THEN NULL ELSE now() END, resolved_by_user_id=CASE WHEN $2='needs_clarification' THEN NULL ELSE $5 END, result_word_id=$6 WHERE id=$1`, [id,status,payload,reason || null,claims.sub,wordId]);
-  if (bool(body.applyToAudio)) await db.query('UPDATE audio_submissions SET moderation_status=$2 WHERE contribution_request_id=$1', [id,status]);
-  await db.query('INSERT INTO moderation_decisions (contribution_request_id, moderator_id, decision, reason, automated_verdict, automated_score) VALUES ($1,$2,$3,$4,$5,$6)', [id,claims.sub,status,reason || null,previous.validation_verdict,previous.validation_score]);
-  await audit(claims, 'request.status_change', 'contribution_request', id, reason || null, { status, wordId }, request); const updated = await db.query(`${requestSql} WHERE cr.id=$1`, [id]); return { request: await mapRequest(updated.rows[0]), createdWordId: wordId, auditLogId: newId() };
+  const body = asObject(request.body); const id = asString((request.params as Json).id);
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    const locked = await client.query('SELECT * FROM contribution_requests WHERE id=$1 FOR UPDATE', [id]);
+    if (!locked.rows[0]) {
+      await client.query('ROLLBACK');
+      return apiError(reply, 404, 'not_found', 'So‘rov topilmadi.');
+    }
+    const previous = locked.rows[0];
+    if (asString(body.expectedUpdatedAt) !== iso(previous.updated_at)) {
+      await client.query('ROLLBACK');
+      return apiError(reply, 409, 'conflict', 'So‘rov boshqa moderator tomonidan yangilangan.');
+    }
+    const status = asString(body.status); const reason = asString(body.reason);
+    if (!['approved','rejected','needs_clarification'].includes(status) || (status !== 'approved' && !reason)) {
+      await client.query('ROLLBACK');
+      return apiError(reply, 422, 'validation_failed', 'Qaror va zarur bo‘lsa sababi kiritilishi shart.');
+    }
+    const sourcePayload = asObject(previous.payload);
+    const overrides = asObject(body.overrides);
+    // Source payload audit dalilidir: foydalanuvchining `proposedRegion`
+    // qiymatini moderator qarori bilan almashtirmaymiz.
+    const storedPayload: Json = { ...sourcePayload, ...overrides };
+    if (sourcePayload.proposedRegion !== undefined) storedPayload.proposedRegion = sourcePayload.proposedRegion;
+    let wordId: string | null = null; let regionResolution: Json | null = null; let dialectResolution: Json | null = null;
+    if (status === 'approved') {
+      const publication = await payloadForPublication(sourcePayload, overrides, client);
+      regionResolution = publication.regionResolution;
+      dialectResolution = publication.dialectResolution;
+      const published = publication.payload;
+      storedPayload.regionId = published.regionId;
+      for (const field of ['districtId', 'villageId', 'neighborhood'] as const) {
+        if (published[field]) storedPayload[field] = published[field];
+        else delete storedPayload[field];
+      }
+      const createdWord = await client.query(`INSERT INTO words (word, literary_form, meaning, example, category, phonetic_key, status, region_id, district_id, village_id, dialect_id, clan, dialect_score, source_request_id) VALUES ($1,$2,$3,$4,$5,$6,'published',$7,$8,$9,$10,$11,$12,$13) RETURNING id`, [published.word, published.literaryForm ?? null, published.meaning, published.example ?? null, published.category ?? null, phoneticKey(String(published.word)), published.regionId ?? null, published.districtId ?? null, published.villageId ?? null, published.dialectId ?? null, published.clan ?? null, previous.validation_score, id]);
+      wordId = createdWord.rows[0].id;
+    }
+    await client.query(`UPDATE contribution_requests SET status=$2, payload=$3, clarification_note=$4, resolved_at=CASE WHEN $2='needs_clarification' THEN NULL ELSE now() END, resolved_by_user_id=CASE WHEN $2='needs_clarification' THEN NULL ELSE $5 END, result_word_id=$6 WHERE id=$1`, [id,status,storedPayload,reason || null,claims.sub,wordId]);
+    if (bool(body.applyToAudio)) await client.query('UPDATE audio_submissions SET moderation_status=$2 WHERE contribution_request_id=$1', [id,status]);
+    await client.query('INSERT INTO moderation_decisions (contribution_request_id, moderator_id, decision, reason, automated_verdict, automated_score) VALUES ($1,$2,$3,$4,$5,$6)', [id,claims.sub,status,reason || null,previous.validation_verdict,previous.validation_score]);
+    const auditLogId = await audit(claims, 'request.status_change', 'contribution_request', id, reason || null, { status, wordId, regionResolution, dialectResolution }, request, client);
+    await client.query('COMMIT');
+    const updated = await db.query(`${requestSql} WHERE cr.id=$1`, [id]);
+    return { request: await mapRequest(updated.rows[0]), createdWordId: wordId, auditLogId };
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    if (error instanceof RouteFault) return apiError(reply, error.status, error.code, error.message);
+    if ((error as { code?: string }).code === '23505') return apiError(reply, 409, 'conflict', 'Shunga o‘xshash so‘z bu hududda allaqachon mavjud.');
+    throw error;
+  } finally {
+    client.release();
+  }
 });
 
 app.patch('/v3/words/:id', async (request, reply) => {
