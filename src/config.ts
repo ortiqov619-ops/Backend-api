@@ -21,6 +21,14 @@ export const config = {
   supabaseBucket: process.env.SUPABASE_STORAGE_BUCKET ?? 'xorazm-audio',
   groqApiKey: process.env.GROQ_API_KEY,
   groqModel: process.env.GROQ_STT_MODEL ?? 'whisper-large-v3',
+  publicBaseUrl: (
+    process.env.PUBLIC_BASE_URL
+    ?? process.env.RENDER_EXTERNAL_URL
+    ?? `http://127.0.0.1:${process.env.PORT ?? 3000}`
+  ).replace(/\/+$/, ''),
+  trustProxy: process.env.TRUST_PROXY === 'true'
+    || Boolean(process.env.RENDER)
+    || Boolean(process.env.RAILWAY_ENVIRONMENT),
 };
 
 export function assertProductionConfig(): void {

@@ -1,19 +1,28 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { basename, join } from 'node:path';
-import { Readable } from 'node:stream';
+import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
+import { basename, join, resolve, sep } from 'node:path';
 import bcrypt from 'bcryptjs';
 import cors from '@fastify/cors';
 import multipart from '@fastify/multipart';
 import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify';
-import { Pool, type QueryResultRow } from 'pg';
+import { Pool, type PoolClient, type QueryResultRow } from 'pg';
 import { AUDIO_LIMITS, evaluateLocationGate, phoneticKey, validateContributionText } from '@xorazm/shared';
+import { fixedWindow, normalizeExpectedText, sameAudioFingerprint, type AudioIdempotencyFingerprint } from './audio-hardening';
 import { assertProductionConfig, config } from './config';
-import { decryptSecret, encryptSecret, hashToken, newId, signAccessToken, verifyAccessToken } from './security';
+import {
+  decryptSecret,
+  encryptSecret,
+  hashToken,
+  newId,
+  signAccessToken,
+  signAudioPlaybackToken,
+  verifyAccessToken,
+  verifyAudioPlaybackToken,
+} from './security';
 
 assertProductionConfig();
 const db = new Pool({ connectionString: config.databaseUrl, ssl: process.env.DATABASE_SSL === 'true' ? { rejectUnauthorized: false } : undefined });
-const app = Fastify({ logger: true, bodyLimit: 10 * 1024 * 1024 });
+const app = Fastify({ logger: true, bodyLimit: 10 * 1024 * 1024, trustProxy: config.trustProxy });
 
 // `tsx` executes this entrypoint as CommonJS in the production Docker image.
 // Keep plugin setup in a promise so the file has no top-level `await`.
@@ -25,6 +34,17 @@ const pluginsReady = Promise.all([
 type Json = Record<string, unknown>;
 type Claims = { sub: string; roles: string[]; permissions: string[] };
 
+class RouteFault extends Error {
+  constructor(
+    readonly status: number,
+    readonly code: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'RouteFault';
+  }
+}
+
 function iso(value: unknown): string | null { return value ? new Date(String(value)).toISOString() : null; }
 function requiredIso(value: unknown): string { return new Date(String(value)).toISOString(); }
 function page(input: unknown, fallback = 1): number { const value = Number(input ?? fallback); return Number.isFinite(value) ? Math.max(1, Math.floor(value)) : fallback; }
@@ -35,11 +55,51 @@ function apiError(reply: FastifyReply, status: number, code: string, message: st
 function asObject(value: unknown): Json { return typeof value === 'object' && value !== null ? value as Json : {}; }
 function asString(value: unknown): string { return typeof value === 'string' ? value.trim() : ''; }
 function bool(value: unknown): boolean { return value === true || value === 'true'; }
+function nullableString(value: unknown): string | null { return asString(value) || null; }
+function isUuid(value: string): boolean { return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value); }
 function multipartFieldValue(field: unknown): string {
   const candidate = Array.isArray(field) ? field[0] : field;
   return typeof candidate === 'object' && candidate !== null && 'value' in candidate
     ? String((candidate as { value: unknown }).value ?? '')
     : '';
+}
+
+let rateLimitCleanupCounter = 0;
+async function enforceRateLimit(
+  request: FastifyRequest,
+  reply: FastifyReply,
+  scope: string,
+  limit: number,
+  windowSeconds: number,
+): Promise<boolean> {
+  const { windowStartMs, resetAtMs } = fixedWindow(Date.now(), windowSeconds);
+  // IP manzilni ochiq saqlamaymiz. `trustProxy` faqat hosting proxylarida
+  // yoqiladi, shuning uchun barcha foydalanuvchi bitta internal IP bo'lib qolmaydi.
+  const bucket = `${scope}:${hashToken(request.ip).slice(0, 32)}`;
+  const result = await db.query<{ request_count: number }>(
+    `INSERT INTO api_rate_limits (bucket, window_start_ms, request_count, expires_at)
+     VALUES ($1,$2,1,to_timestamp($3 / 1000.0))
+     ON CONFLICT (bucket, window_start_ms)
+     DO UPDATE SET request_count = api_rate_limits.request_count + 1
+     RETURNING request_count`,
+    [bucket, windowStartMs, resetAtMs],
+  );
+  const count = Number(result.rows[0]?.request_count ?? limit + 1);
+  const remaining = Math.max(0, limit - count);
+  reply.header('X-RateLimit-Limit', String(limit));
+  reply.header('X-RateLimit-Remaining', String(remaining));
+  reply.header('X-RateLimit-Reset', String(Math.ceil(resetAtMs / 1_000)));
+
+  rateLimitCleanupCounter += 1;
+  if (rateLimitCleanupCounter % 100 === 0) {
+    void db.query("DELETE FROM api_rate_limits WHERE expires_at < now() - interval '1 day'")
+      .catch((error: unknown) => app.log.warn(error, 'Eski rate-limit yozuvlari tozalanmadi'));
+  }
+
+  if (count <= limit) return true;
+  reply.header('Retry-After', String(Math.max(1, Math.ceil((resetAtMs - Date.now()) / 1_000))));
+  apiError(reply, 429, 'rate_limited', 'Juda ko‘p audio so‘rovi yuborildi. Biroz kutib qayta urinib ko‘ring.');
+  return false;
 }
 
 async function claimsFor(request: FastifyRequest, permission?: string): Promise<Claims | null> {
@@ -96,18 +156,104 @@ function practicalMobileGate(sample: Json, geofences: Awaited<ReturnType<typeof 
   return evaluateLocationGate({ sample: sample as never, permission: 'granted', geofences: relaxedFences });
 }
 
+async function createPlaybackAccess(row: QueryResultRow): Promise<{ playbackUrl: string; playbackUrlExpiresAt: string }> {
+  const audioId = String(row.audio_id ?? row.id);
+  const expiresAt = new Date(Date.now() + 5 * 60_000).toISOString();
+  if (row.storage_bucket === 'local') {
+    const signed = await signAudioPlaybackToken(audioId);
+    return {
+      playbackUrl: `${config.publicBaseUrl}/v3/audio/${encodeURIComponent(audioId)}?token=${encodeURIComponent(signed.token)}`,
+      playbackUrlExpiresAt: signed.expiresAt,
+    };
+  }
+
+  if (!config.supabaseUrl || !config.supabaseServiceRoleKey) {
+    throw new RouteFault(503, 'provider_unavailable', 'Bulut audio storage sozlanmagan.');
+  }
+  const encodedKey = String(row.storage_key).split('/').map(encodeURIComponent).join('/');
+  const response = await fetch(
+    `${config.supabaseUrl}/storage/v1/object/sign/${encodeURIComponent(String(row.storage_bucket))}/${encodedKey}`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${config.supabaseServiceRoleKey}`,
+        apikey: config.supabaseServiceRoleKey,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ expiresIn: 300 }),
+    },
+  );
+  if (!response.ok) throw new RouteFault(503, 'provider_unavailable', 'Bulut audio havolasini yaratib bo‘lmadi.');
+  const payload = await response.json() as { signedURL?: string; signedUrl?: string };
+  const signedPath = payload.signedURL ?? payload.signedUrl;
+  if (!signedPath) throw new RouteFault(503, 'provider_unavailable', 'Bulut audio havolasi qaytmadi.');
+  return {
+    playbackUrl: signedPath.startsWith('http') ? signedPath : `${config.supabaseUrl}/storage/v1${signedPath}`,
+    playbackUrlExpiresAt: expiresAt,
+  };
+}
+
+async function mapAudioSubmission(row: QueryResultRow) {
+  const id = String(row.audio_id ?? row.id);
+  const playback = await createPlaybackAccess(row);
+  const engineName = row.audio_engine_name ?? row.engine_name;
+  const engineVersion = row.audio_engine_version ?? row.engine_version;
+  const engineProvider = row.audio_engine_provider ?? row.engine_provider;
+  const createdAt = row.audio_created_at ?? row.created_at;
+  const updatedAt = row.audio_updated_at ?? row.updated_at;
+  return {
+    id,
+    contributionRequestId: row.audio_contribution_request_id ?? row.contribution_request_id ?? null,
+    wordId: row.audio_word_id ?? row.word_id ?? null,
+    storageKey: row.storage_key,
+    ...playback,
+    mimeType: row.mime_type,
+    durationMs: Number(row.duration_ms),
+    sizeBytes: Number(row.size_bytes),
+    sampleRateHz: row.sample_rate_hz ?? null,
+    checksumSha256: row.checksum_sha256,
+    expectedText: row.expected_text,
+    analysis: {
+      status: row.analysis_status,
+      stage: row.pipeline_stage,
+      transcript: row.transcript ?? null,
+      transcriptConfidence: row.transcript_confidence ?? null,
+      detectedLanguage: row.detected_language ?? null,
+      dialectConfidence: row.dialect_confidence ?? null,
+      pronunciationSimilarity: row.pronunciation_similarity ?? null,
+      textAudioMatch: row.text_audio_match ?? null,
+      overallScore: row.overall_score ?? null,
+      reasons: row.analysis_reasons ?? [],
+      requiresHumanReview: Boolean(row.audio_requires_review ?? row.requires_human_review),
+      engine: engineName && engineVersion ? {
+        kind: engineProvider ? 'hybrid' : 'rules',
+        name: engineName,
+        version: engineVersion,
+        ...(engineProvider ? { provider: engineProvider } : {}),
+      } : null,
+      analyzedAt: iso(row.analyzed_at),
+      failureMessage: row.audio_failure_message ?? row.failure_message ?? null,
+    },
+    moderationStatus: row.audio_moderation_status ?? row.moderation_status,
+    createdAt: requiredIso(createdAt),
+    updatedAt: requiredIso(updatedAt),
+  };
+}
+
 async function mapRequest(row: QueryResultRow) {
-  const audio = row.audio_id ? {
-    id: row.audio_id, contributionRequestId: row.id, storageKey: row.storage_key, mimeType: row.mime_type, durationMs: row.duration_ms,
-    sizeBytes: row.size_bytes, checksumSha256: row.checksum_sha256, expectedText: row.expected_text,
-    analysis: { status: row.analysis_status, stage: row.pipeline_stage, transcript: row.transcript, transcriptConfidence: row.transcript_confidence, detectedLanguage: row.detected_language, dialectConfidence: row.dialect_confidence, pronunciationSimilarity: row.pronunciation_similarity, textAudioMatch: row.text_audio_match, overallScore: row.overall_score, reasons: row.analysis_reasons ?? [], requiresHumanReview: row.audio_requires_review, analyzedAt: iso(row.analyzed_at) },
-    moderationStatus: row.audio_moderation_status, createdAt: iso(row.audio_created_at), updatedAt: iso(row.audio_updated_at),
-  } : null;
+  const audio = row.audio_id ? await mapAudioSubmission(row) : null;
   return { id: row.id, type: row.type, status: row.status, payload: row.payload, submittedByUserId: row.submitted_by_user_id, submittedByDisplayName: row.submitted_by_display_name, device: row.device, latitude: row.latitude, longitude: row.longitude, locationAccuracyM: row.location_accuracy_m, locationCheckedAt: iso(row.location_checked_at), submissionLocationStatus: row.submission_location_status, matchedGeofenceId: row.matched_geofence_id, geofenceVersion: row.geofence_version, validationVerdict: row.validation_verdict, validationScore: row.validation_score, validationResults: row.validation_results ?? [], audio, clarificationNote: row.clarification_note, resolvedAt: iso(row.resolved_at), resolvedByUserId: row.resolved_by_user_id, resultWordId: row.result_word_id, createdAt: iso(row.created_at), updatedAt: iso(row.updated_at) };
 }
-const requestSql = `SELECT cr.*, a.id AS audio_id, a.storage_key, a.mime_type, a.duration_ms, a.size_bytes, a.checksum_sha256, a.expected_text, a.analysis_status, a.pipeline_stage, a.transcript, a.transcript_confidence, a.detected_language, a.dialect_confidence, a.pronunciation_similarity, a.text_audio_match, a.overall_score, a.analysis_reasons, a.requires_human_review AS audio_requires_review, a.moderation_status AS audio_moderation_status, a.analyzed_at, a.created_at AS audio_created_at, a.updated_at AS audio_updated_at,
+const requestSql = `SELECT cr.*, a.id AS audio_id, a.contribution_request_id AS audio_contribution_request_id, a.word_id AS audio_word_id, a.storage_bucket, a.storage_key, a.mime_type, a.duration_ms, a.size_bytes, a.sample_rate_hz, a.checksum_sha256, a.expected_text, a.analysis_status, a.pipeline_stage, a.transcript, a.transcript_confidence, a.detected_language, a.dialect_confidence, a.pronunciation_similarity, a.text_audio_match, a.overall_score, a.analysis_reasons, a.requires_human_review AS audio_requires_review, a.engine_name AS audio_engine_name, a.engine_version AS audio_engine_version, a.engine_provider AS audio_engine_provider, a.failure_message AS audio_failure_message, a.moderation_status AS audio_moderation_status, a.analyzed_at, a.created_at AS audio_created_at, a.updated_at AS audio_updated_at,
   COALESCE((SELECT jsonb_agg(jsonb_build_object('subject', vr.subject, 'verdict', vr.verdict, 'score', vr.score, 'confidence', vr.confidence, 'reasons', vr.reasons, 'origin', vr.origin, 'evaluatedAt', vr.evaluated_at)) FROM validation_results vr WHERE vr.contribution_request_id = cr.id), '[]'::jsonb) AS validation_results
-FROM contribution_requests cr LEFT JOIN audio_submissions a ON a.contribution_request_id = cr.id`;
+FROM contribution_requests cr
+LEFT JOIN LATERAL (
+  SELECT candidate.*
+  FROM audio_submissions candidate
+  WHERE candidate.contribution_request_id = cr.id
+  ORDER BY candidate.created_at DESC, candidate.id DESC
+  LIMIT 1
+) a ON true`;
 
 async function loadIntegrationSecret(provider: string): Promise<string | null> {
   const result = await db.query<{ secret_ciphertext: Buffer | null; secret_nonce: Buffer | null }>('SELECT secret_ciphertext, secret_nonce FROM integration_secrets WHERE provider = $1 AND is_enabled = true', [provider]);
@@ -125,6 +271,25 @@ async function storeAudio(buffer: Buffer, filename: string, mimeType: string): P
   await mkdir(join(fullPath, '..'), { recursive: true });
   await writeFile(fullPath, buffer);
   return { bucket: 'local', key };
+}
+
+async function deleteStoredAudio(stored: { bucket: string; key: string }): Promise<void> {
+  if (stored.bucket === 'local') {
+    await unlink(join(config.uploadDir, stored.key)).catch(() => undefined);
+    return;
+  }
+  if (!config.supabaseUrl || !config.supabaseServiceRoleKey) return;
+  const encodedKey = stored.key.split('/').map(encodeURIComponent).join('/');
+  await fetch(
+    `${config.supabaseUrl}/storage/v1/object/${encodeURIComponent(stored.bucket)}/${encodedKey}`,
+    {
+      method: 'DELETE',
+      headers: {
+        Authorization: `Bearer ${config.supabaseServiceRoleKey}`,
+        apikey: config.supabaseServiceRoleKey,
+      },
+    },
+  ).catch(() => undefined);
 }
 async function transcribe(buffer: Buffer, filename: string, mimeType: string): Promise<{ text: string; confidence: number | null; language: string | null }> {
   const key = await loadIntegrationSecret('stt_primary') ?? config.groqApiKey;
@@ -287,12 +452,16 @@ app.post('/v3/contributions/words', async (request, reply) => {
 });
 
 app.post('/v3/audio/transcriptions', async (request, reply) => {
+  if (!(await enforceRateLimit(request, reply, 'audio-transcription', 12, 10 * 60))) return;
   const file = await request.file(); if (!file) return apiError(reply, 422, 'validation_failed', 'Audio fayl topilmadi.');
   const buffer = await file.toBuffer();
+  if (!AUDIO_LIMITS.allowedMimeTypes.includes(file.mimetype as never)) return apiError(reply, 415, 'unsupported_media_type', 'Audio formati qo‘llab-quvvatlanmaydi.');
+  if (!buffer.length || buffer.length > AUDIO_LIMITS.maxSizeBytes) return apiError(reply, 413, 'payload_too_large', 'Audio fayl hajmi noto‘g‘ri.');
   try { const result = await transcribe(buffer, file.filename, file.mimetype); return result; } catch (error) { return apiError(reply, 503, 'provider_unavailable', error instanceof Error ? error.message : 'STT ishlamayapti.'); }
 });
 
 app.post('/v3/contributions/audio', async (request, reply) => {
+  if (!(await enforceRateLimit(request, reply, 'audio-upload', 30, 15 * 60))) return;
   const file = await request.file(); if (!file) return apiError(reply, 422, 'validation_failed', 'Audio fayl topilmadi.');
   const buffer = await file.toBuffer();
   const metaText = multipartFieldValue(file.fields.meta); let meta: Json = {};
@@ -300,23 +469,125 @@ app.post('/v3/contributions/audio', async (request, reply) => {
   const headerKey = Array.isArray(request.headers['idempotency-key']) ? request.headers['idempotency-key'][0] : request.headers['idempotency-key'];
   const idempotencyKey = asString(meta.idempotencyKey) || asString(headerKey);
   const durationMs = Number(meta.durationMs);
+  const contributionRequestId = nullableString(meta.contributionRequestId);
+  const wordId = nullableString(meta.wordId);
+  const expectedText = asString(meta.expectedText);
+  const device = asObject(meta.device);
+  const installationId = asString(device.installationId);
   if (!idempotencyKey || idempotencyKey.length > 255) return apiError(reply, 422, 'validation_failed', 'Audio idempotency kaliti majburiy.');
+  if (!expectedText || expectedText.length > 160) return apiError(reply, 422, 'validation_failed', 'Kutilgan so‘z noto‘g‘ri.');
+  if (!installationId || installationId.length > 160) return apiError(reply, 422, 'validation_failed', 'Qurilma identifikatori majburiy.');
+  if (!idempotencyKey.startsWith(`${installationId}:`)) return apiError(reply, 403, 'forbidden', 'Audio kaliti ushbu qurilmaga tegishli emas.');
+  if (Number(Boolean(contributionRequestId)) + Number(Boolean(wordId)) !== 1) return apiError(reply, 422, 'validation_failed', 'Audio bitta so‘z yoki bitta taklifga biriktirilishi kerak.');
+  if ((contributionRequestId && !isUuid(contributionRequestId)) || (wordId && !isUuid(wordId))) return apiError(reply, 422, 'validation_failed', 'Audio nishoni noto‘g‘ri.');
   if (!Number.isFinite(durationMs) || durationMs < AUDIO_LIMITS.minDurationMs || durationMs > AUDIO_LIMITS.maxDurationMs) {
     return apiError(reply, 422, 'validation_failed', 'Audio davomiyligi 0,7–40 soniya bo‘lishi kerak.');
   }
+  if (asString(meta.mimeType) && asString(meta.mimeType) !== file.mimetype) return apiError(reply, 422, 'validation_failed', 'Audio MIME metama’lumoti faylga mos emas.');
   if (!AUDIO_LIMITS.allowedMimeTypes.includes(file.mimetype as never)) return apiError(reply, 415, 'unsupported_media_type', 'Audio formati qo‘llab-quvvatlanmaydi.');
   if (!buffer.length || buffer.length > AUDIO_LIMITS.maxSizeBytes) return apiError(reply, 413, 'payload_too_large', 'Audio fayl hajmi noto‘g‘ri.');
-  const existing = await db.query('SELECT * FROM audio_submissions WHERE idempotency_key=$1', [idempotencyKey]);
-  if (existing.rows[0]) {
-    const row = existing.rows[0];
-    return { submission: { id:row.id, contributionRequestId:row.contribution_request_id, wordId:row.word_id, storageKey:row.storage_key, mimeType:row.mime_type, durationMs:row.duration_ms, sizeBytes:row.size_bytes, checksumSha256:row.checksum_sha256, expectedText:row.expected_text, moderationStatus:row.moderation_status, createdAt:iso(row.created_at), updatedAt:iso(row.updated_at) }, userMessage:'Avvalgi audio so‘rovi qaytarildi.' };
+  const checksumSha256 = createHash('sha256').update(buffer).digest('hex');
+  const incomingFingerprint: AudioIdempotencyFingerprint = {
+    contributionRequestId,
+    wordId,
+    checksumSha256,
+    mimeType: file.mimetype,
+    durationMs,
+    expectedText,
+  };
+
+  const client: PoolClient = await db.connect();
+  let transactionOpen = false;
+  let stored: { bucket: string; key: string } | null = null;
+  let targetStatus = '';
+  let targetExpectedText = '';
+  try {
+    await client.query('BEGIN');
+    transactionOpen = true;
+    // DB advisory lock barcha Render instansiyalari orasida ham bir xil
+    // idempotency/target amallarini ketma-ket bajaradi.
+    const lockKeys = [
+      `audio:idempotency:${idempotencyKey}`,
+      contributionRequestId ? `audio:request:${contributionRequestId}` : `audio:word:${wordId}`,
+    ].sort();
+    for (const lockKey of lockKeys) {
+      await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [lockKey]);
+    }
+
+    if (contributionRequestId) {
+      const target = await client.query('SELECT id, status, payload, device FROM contribution_requests WHERE id=$1 FOR UPDATE', [contributionRequestId]);
+      const targetRow = target.rows[0];
+      if (!targetRow) throw new RouteFault(404, 'not_found', 'So‘z taklifi topilmadi.');
+      const ownerInstallationId = asString(asObject(targetRow.device).installationId);
+      if (!ownerInstallationId || ownerInstallationId !== installationId) {
+        throw new RouteFault(403, 'forbidden', 'Bu taklif boshqa qurilmaga tegishli.');
+      }
+      targetStatus = String(targetRow.status);
+      targetExpectedText = asString(asObject(targetRow.payload).word);
+    } else {
+      const target = await client.query('SELECT id, status FROM words WHERE id=$1', [wordId]);
+      if (!target.rows[0]) throw new RouteFault(404, 'not_found', 'Lug‘at so‘zi topilmadi.');
+      targetStatus = String(target.rows[0].status);
+    }
+
+    const existing = await client.query('SELECT * FROM audio_submissions WHERE idempotency_key=$1', [idempotencyKey]);
+    if (existing.rows[0]) {
+      const row = existing.rows[0];
+      const storedFingerprint: AudioIdempotencyFingerprint = {
+        contributionRequestId: nullableString(row.contribution_request_id),
+        wordId: nullableString(row.word_id),
+        checksumSha256: String(row.checksum_sha256),
+        mimeType: String(row.mime_type),
+        durationMs: Number(row.duration_ms),
+        expectedText: String(row.expected_text),
+      };
+      if (!sameAudioFingerprint(storedFingerprint, incomingFingerprint)) {
+        throw new RouteFault(409, 'conflict', 'Idempotency kaliti boshqa audio uchun avval ishlatilgan.');
+      }
+      await client.query('COMMIT');
+      transactionOpen = false;
+      return { submission: await mapAudioSubmission(row), userMessage: 'Avvalgi audio so‘rovi qaytarildi.' };
+    }
+
+    // Idempotent retry avvalgi muvaffaqiyatli javobni holat keyin o‘zgargan
+    // bo‘lsa ham qaytaradi; yangi upload esa joriy target holatini tekshiradi.
+    if (contributionRequestId) {
+      if (!['pending', 'needs_clarification'].includes(targetStatus)) {
+        throw new RouteFault(409, 'conflict', 'Yakunlangan taklifga audio qo‘shib bo‘lmaydi.');
+      }
+      if (normalizeExpectedText(targetExpectedText) !== normalizeExpectedText(expectedText)) {
+        throw new RouteFault(422, 'validation_failed', 'Audio so‘zi taklifdagi so‘zga mos emas.');
+      }
+    } else if (targetStatus !== 'published') {
+      throw new RouteFault(409, 'conflict', 'Nashr qilinmagan lug‘at so‘ziga audio qo‘shib bo‘lmaydi.');
+    }
+
+    if (contributionRequestId) {
+      const attached = await client.query('SELECT id FROM audio_submissions WHERE contribution_request_id=$1 LIMIT 1', [contributionRequestId]);
+      if (attached.rows[0]) throw new RouteFault(409, 'conflict', 'Bu taklifga audio allaqachon biriktirilgan.');
+    } else {
+      const duplicate = await client.query('SELECT id FROM audio_submissions WHERE word_id=$1 AND checksum_sha256=$2 LIMIT 1', [wordId, checksumSha256]);
+      if (duplicate.rows[0]) throw new RouteFault(409, 'conflict', 'Aynan shu audio lug‘at so‘ziga avval qo‘shilgan.');
+    }
+
+    // Storage yozuvi transaction lock ostida yaratiladi. Keyingi DB bosqichi
+    // xato bersa exact key darhol o‘chiriladi va orphan fayl qolmaydi.
+    stored = await storeAudio(buffer, file.filename, file.mimetype);
+    const created = await client.query(`INSERT INTO audio_submissions (contribution_request_id, word_id, storage_bucket, storage_key, mime_type, duration_ms, size_bytes, checksum_sha256, expected_text, moderation_status, idempotency_key)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending',$10) RETURNING *`, [contributionRequestId, wordId, stored.bucket, stored.key, file.mimetype, durationMs, buffer.length, checksumSha256, expectedText, idempotencyKey]);
+    await client.query('COMMIT');
+    transactionOpen = false;
+    stored = null;
+    return reply.status(201).send({ submission: await mapAudioSubmission(created.rows[0]), userMessage: 'Audio moderator tekshiruviga yuborildi.' });
+  } catch (error) {
+    if (transactionOpen) await client.query('ROLLBACK').catch(() => undefined);
+    if (stored) await deleteStoredAudio(stored);
+    if (error instanceof RouteFault) return apiError(reply, error.status, error.code, error.message);
+    if ((error as { code?: string }).code === '23505') return apiError(reply, 409, 'conflict', 'Audio allaqachon biriktirilgan.');
+    throw error;
+  } finally {
+    client.release();
   }
-  // Audio ham GPS talab qilmaydi; u faqat avval yaratilgan moderatsiya
-  // so'roviga biriktiriladi va admin tasdiqlamaguncha nashr etilmaydi.
-  const stored = await storeAudio(buffer, file.filename, file.mimetype); const checksum = createHash('sha256').update(buffer).digest('hex');
-  const created = await db.query(`INSERT INTO audio_submissions (contribution_request_id, word_id, storage_bucket, storage_key, mime_type, duration_ms, size_bytes, checksum_sha256, expected_text, moderation_status, idempotency_key)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending',$10) RETURNING *`, [meta.contributionRequestId ?? null, meta.wordId ?? null, stored.bucket, stored.key, file.mimetype, durationMs, buffer.length, checksum, asString(meta.expectedText), idempotencyKey]);
-  return { submission: { id: created.rows[0].id, contributionRequestId:meta.contributionRequestId ?? null, wordId:meta.wordId ?? null, storageKey: stored.key, mimeType: file.mimetype, durationMs, sizeBytes: buffer.length, checksumSha256: checksum, expectedText: asString(meta.expectedText), moderationStatus: 'pending', createdAt:iso(created.rows[0].created_at), updatedAt:iso(created.rows[0].updated_at) }, userMessage: 'Audio moderator tekshiruviga yuborildi.' };
 });
 
 app.get('/v3/requests', async (request, reply) => {
@@ -324,6 +595,11 @@ app.get('/v3/requests', async (request, reply) => {
   const query = request.query as Json; const params: unknown[] = []; const where: string[] = [];
   for (const [input, column] of [['status','cr.status'],['type','cr.type'],['verdict','cr.validation_verdict'],['locationStatus','cr.submission_location_status']] as const) if (query[input]) { params.push(query[input]); where.push(`${column}=$${params.length}`); }
   if (query.search) { params.push(`%${asString(query.search)}%`); where.push(`(cr.payload->>'word' ILIKE $${params.length} OR cr.payload->>'meaning' ILIKE $${params.length})`); }
+  if (query.hasAudio !== undefined) {
+    const hasAudio = String(query.hasAudio).toLowerCase();
+    if (hasAudio !== 'true' && hasAudio !== 'false') return apiError(reply, 422, 'validation_failed', 'hasAudio true yoki false bo‘lishi kerak.');
+    where.push(`${hasAudio === 'false' ? 'NOT ' : ''}EXISTS (SELECT 1 FROM audio_submissions filter_audio WHERE filter_audio.contribution_request_id=cr.id)`);
+  }
   const current = page(query.page); const size = pageSize(query.pageSize); const count = await db.query(`SELECT count(*)::int AS total FROM contribution_requests cr ${where.length ? `WHERE ${where.join(' AND ')}` : ''}`, params); params.push(size, (current - 1) * size);
   const rows = await db.query(`${requestSql} ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY cr.created_at DESC LIMIT $${params.length - 1} OFFSET $${params.length}`, params); const total = count.rows[0].total;
   return { items: await Promise.all(rows.rows.map(mapRequest)), meta: { page: current, pageSize: size, total, totalPages: Math.ceil(total / size) } };
@@ -396,7 +672,85 @@ app.put('/v3/admin/integrations/:provider', async (request, reply) => { const cl
 
 app.post('/v3/telemetry/app-opens', async (request, reply) => { const body=asObject(request.body); if (!asString(body.installationId)||!asString(body.appVersion)||!asString(body.openedAt)) return apiError(reply,422,'validation_failed','Hodisa ma’lumoti to‘liq emas.'); await db.query('INSERT INTO app_open_events (installation_id,app_version,location_consent,classification,region_id,opened_at) VALUES ($1,$2,$3,$4,$5,$6)',[body.installationId,body.appVersion,bool(body.locationConsent),body.classification ?? 'unknown',body.regionId ?? null,body.openedAt]); return reply.status(202).send({ accepted:true }); });
 
-app.get('/v3/audio/:id', async (request, reply) => { const row=(await db.query('SELECT * FROM audio_submissions WHERE id=$1',[(request.params as Json).id])).rows[0]; if(!row) return apiError(reply,404,'not_found','Audio topilmadi.'); if(row.storage_bucket!=='local') return apiError(reply,501,'provider_unavailable','Bulut audio havolasi hali sozlanmagan.'); try { const audio=await readFile(join(config.uploadDir,row.storage_key)); return reply.type(row.mime_type).send(Readable.from(audio)); } catch { return apiError(reply,404,'not_found','Audio fayl topilmadi.'); } });
+app.get('/v3/audio/:id', async (request, reply) => {
+  const audioId = asString((request.params as Json).id);
+  if (!isUuid(audioId)) return apiError(reply, 404, 'not_found', 'Audio topilmadi.');
+  const bearerClaims = await claimsFor(request, 'audio:read');
+  let hasPlaybackToken = false;
+  const playbackToken = asString((request.query as Json).token);
+  if (playbackToken) {
+    try {
+      await verifyAudioPlaybackToken(playbackToken, audioId);
+      hasPlaybackToken = true;
+    } catch {
+      hasPlaybackToken = false;
+    }
+  }
+  if (!bearerClaims && !hasPlaybackToken) {
+    const credentialsProvided = Boolean(request.headers.authorization || playbackToken);
+    return apiError(
+      reply,
+      credentialsProvided ? 403 : 401,
+      credentialsProvided ? 'forbidden' : 'unauthorized',
+      credentialsProvided ? 'Audio havolasi yaroqsiz yoki muddati tugagan.' : 'Audio tinglash uchun ruxsat kerak.',
+    );
+  }
+
+  const row = (await db.query('SELECT * FROM audio_submissions WHERE id=$1', [audioId])).rows[0];
+  if (!row) return apiError(reply, 404, 'not_found', 'Audio topilmadi.');
+  // Supabase obyektlari `createPlaybackAccess` bergan native 5 daqiqalik
+  // storage URL orqali tinglanadi; bu endpoint faqat private local diskdir.
+  if (row.storage_bucket !== 'local') return apiError(reply, 409, 'storage_mismatch', 'Bu audio uchun storage havolasidan foydalaning.');
+
+  const uploadRoot = resolve(config.uploadDir);
+  const audioPath = resolve(uploadRoot, String(row.storage_key));
+  if (audioPath !== uploadRoot && !audioPath.startsWith(`${uploadRoot}${sep}`)) {
+    app.log.error({ audioId }, 'Audio storage key upload papkasidan tashqariga chiqdi');
+    return apiError(reply, 404, 'not_found', 'Audio fayl topilmadi.');
+  }
+
+  try {
+    const audio = await readFile(audioPath);
+    reply.header('Accept-Ranges', 'bytes');
+    reply.header('Cache-Control', 'private, max-age=300');
+    const range = request.headers.range;
+    if (!range) {
+      return reply.type(String(row.mime_type)).header('Content-Length', String(audio.length)).send(audio);
+    }
+
+    const match = /^bytes=(\d*)-(\d*)$/.exec(range);
+    let start: number;
+    let end: number;
+    if (!match || (!match[1] && !match[2])) {
+      return reply.status(416).header('Content-Range', `bytes */${audio.length}`).send();
+    }
+    if (!match[1]) {
+      const suffixLength = Number(match[2]);
+      if (!Number.isSafeInteger(suffixLength) || suffixLength <= 0) {
+        return reply.status(416).header('Content-Range', `bytes */${audio.length}`).send();
+      }
+      start = Math.max(0, audio.length - suffixLength);
+      end = audio.length - 1;
+    } else {
+      start = Number(match[1]);
+      end = match[2] ? Number(match[2]) : audio.length - 1;
+    }
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || start >= audio.length || end < start) {
+      return reply.status(416).header('Content-Range', `bytes */${audio.length}`).send();
+    }
+    end = Math.min(end, audio.length - 1);
+    const chunk = audio.subarray(start, end + 1);
+    return reply
+      .status(206)
+      .type(String(row.mime_type))
+      .header('Content-Range', `bytes ${start}-${end}/${audio.length}`)
+      .header('Content-Length', String(chunk.length))
+      .send(chunk);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return apiError(reply, 404, 'not_found', 'Audio fayl topilmadi.');
+    throw error;
+  }
+});
 
 app.setErrorHandler((error, _request, reply) => { app.log.error(error); if ((error as { code?: string }).code === 'FST_REQ_FILE_TOO_LARGE') return apiError(reply,413,'payload_too_large','Audio 8 MB dan oshmasligi kerak.'); return apiError(reply,500,'internal_error','Serverda kutilmagan xatolik yuz berdi.'); });
 

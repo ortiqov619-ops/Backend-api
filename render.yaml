@@ -18,3 +18,7 @@ services:
         value: /var/data/uploads
       - key: PORT
         value: "3000"
+      - key: PUBLIC_BASE_URL
+        value: https://xorazm-shevalari-backend-api.onrender.com
+      - key: TRUST_PROXY
+        value: "true"

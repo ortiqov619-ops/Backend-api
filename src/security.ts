@@ -3,6 +3,7 @@ import { SignJWT, jwtVerify } from 'jose';
 import { config } from './config';
 
 export interface AccessClaims { sub: string; roles: string[]; permissions: string[]; }
+export interface AudioPlaybackClaims { audioId: string; }
 
 const jwtKey = new TextEncoder().encode(config.jwtSecret);
 const encryptionKey = createHash('sha256').update(config.integrationMasterKey).digest();
@@ -27,6 +28,32 @@ export async function verifyAccessToken(token: string): Promise<AccessClaims> {
   const permissions = Array.isArray(payload.permissions) ? payload.permissions.filter((permission): permission is string => typeof permission === 'string') : [];
   if (!payload.sub) throw new Error('Token subject missing');
   return { sub: payload.sub, roles, permissions };
+}
+
+/** Admin ilovasidagi native player uchun qisqa muddatli, storage'ni oshkor
+ * qilmaydigan playback tokeni. Token faqat bitta audio ID uchun yaroqli. */
+export async function signAudioPlaybackToken(audioId: string): Promise<{ token: string; expiresAt: string }> {
+  const expiresAt = new Date(Date.now() + 5 * 60_000).toISOString();
+  const token = await new SignJWT({ scope: 'audio:playback' })
+    .setProtectedHeader({ alg: 'HS256' })
+    .setIssuer('xorazm-api')
+    .setAudience('xorazm-audio')
+    .setSubject(audioId)
+    .setIssuedAt()
+    .setExpirationTime('5m')
+    .sign(jwtKey);
+  return { token, expiresAt };
+}
+
+export async function verifyAudioPlaybackToken(token: string, audioId: string): Promise<AudioPlaybackClaims> {
+  const { payload } = await jwtVerify(token, jwtKey, {
+    issuer: 'xorazm-api',
+    audience: 'xorazm-audio',
+  });
+  if (payload.sub !== audioId || payload.scope !== 'audio:playback') {
+    throw new Error('Audio playback tokeni noto‘g‘ri.');
+  }
+  return { audioId };
 }
 
 export function encryptSecret(value: string) {

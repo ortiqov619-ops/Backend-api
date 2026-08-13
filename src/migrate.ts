@@ -14,6 +14,7 @@ const migrations = [
   '0004_app_open_events.sql',
   '0005_community_interactions.sql',
   '0006_audio_idempotency.sql',
+  '0007_audio_hardening.sql',
 ];
 
 const db = new Pool({
