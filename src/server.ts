@@ -265,8 +265,14 @@ app.post('/v3/contributions/audio', async (request, reply) => {
   const buffer = await file.toBuffer();
   const metaText = multipartFieldValue(file.fields.meta); let meta: Json = {};
   try { meta = JSON.parse(String(metaText ?? '{}')) as Json; } catch { return apiError(reply, 422, 'validation_failed', 'Audio metama’lumoti noto‘g‘ri.'); }
-  const gate = practicalMobileGate(asObject(meta.location), await activeFences());
-  if (!gate.allowed) return apiError(reply, 422, 'location_outside_geofence', gate.message);
+  const heritageDeclaration = bool(meta.heritageDeclaration);
+  const audioLocation = asObject(meta.location);
+  const hasLocation = Number.isFinite(Number(audioLocation.latitude)) && Number.isFinite(Number(audioLocation.longitude));
+  const geofences = await activeFences();
+  const gate = hasLocation ? practicalMobileGate(audioLocation, geofences) : evaluateLocationGate({ sample: null, permission: 'undetermined', geofences });
+  // Safarda bo'lgan Xorazmlik foydalanuvchi ham talaffuz namunasini yubora oladi.
+  // Bunday yozuvlar so'z so'rovi kabi doim moderator tekshiruvidan o'tadi.
+  if (!gate.allowed && !heritageDeclaration) return apiError(reply, 422, 'location_outside_geofence', gate.message);
   const stored = await storeAudio(buffer, file.filename, file.mimetype); const checksum = createHash('sha256').update(buffer).digest('hex');
   const created = await db.query(`INSERT INTO audio_submissions (contribution_request_id, word_id, storage_bucket, storage_key, mime_type, duration_ms, size_bytes, checksum_sha256, expected_text, moderation_status)
     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending') RETURNING *`, [meta.contributionRequestId ?? null, meta.wordId ?? null, stored.bucket, stored.key, file.mimetype, Number(meta.durationMs), buffer.length, checksum, asString(meta.expectedText)]);
