@@ -70,3 +70,24 @@ test('an access token cannot be reused as a playback token', async () => {
   const access = await security.signAccessToken({ sub: 'user-1', roles: ['admin'], permissions: ['audio:read'] });
   await assert.rejects(() => security.verifyAudioPlaybackToken(access.token, 'user-1'));
 });
+
+test('ilova foydalanuvchisining tokeni admin tokeni sifatida ishlamaydi', async () => {
+  const security = await loadSecurity();
+  const app = await security.signAppUserToken('app-user-1');
+  // Barcha tokenlar bitta kalit bilan imzolanadi, shuning uchun imzo
+  // tekshiruvining o'zi yetarli emas: `verifyAccessToken` auditoriyasi bor
+  // tokenni rad etishi kerak, aks holda oddiy foydalanuvchi o'z tokeni bilan
+  // admin so'rovlarini yubora olardi.
+  await assert.rejects(() => security.verifyAccessToken(app.token));
+  await assert.rejects(() => security.verifyAudioPlaybackToken(app.token, 'app-user-1'));
+  const claims = await security.verifyAppUserToken(app.token);
+  assert.equal(claims.sub, 'app-user-1');
+});
+
+test('admin va audio tokenlari ilova tokeni sifatida ishlamaydi', async () => {
+  const security = await loadSecurity();
+  const admin = await security.signAccessToken({ sub: 'staff-1', roles: ['admin'], permissions: ['words:write'] });
+  const playback = await security.signAudioPlaybackToken('audio-1');
+  await assert.rejects(() => security.verifyAppUserToken(admin.token));
+  await assert.rejects(() => security.verifyAppUserToken(playback.token));
+});

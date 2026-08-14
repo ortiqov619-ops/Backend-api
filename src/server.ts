@@ -33,10 +33,21 @@ import {
   hashToken,
   newId,
   signAccessToken,
+  signAppUserToken,
   signAudioPlaybackToken,
   verifyAccessToken,
+  verifyAppUserToken,
   verifyAudioPlaybackToken,
 } from './security';
+import {
+  isTooSimplePattern,
+  lockStateFor,
+  normalizeDisplayName,
+  normalizePattern,
+  normalizeUsername,
+  PatternValidationError,
+  remainingLockMs,
+} from './pattern-auth';
 import { INSERT_VALIDATION_RESULT, jsonb, UPDATE_REQUEST_RESOLUTION } from './sql';
 
 assertProductionConfig();
@@ -622,6 +633,292 @@ app.post('/v3/auth/admin/refresh', async (request, reply) => {
   return { accessToken: signed.token, accessTokenExpiresAt: signed.expiresAt, refreshToken: nextRefresh };
 });
 app.post('/v3/auth/admin/logout', async (request) => { const auth = request.headers.authorization?.slice(7); if (auth) { const claims = await claimsFor(request); if (claims) await db.query('UPDATE admin_sessions SET revoked_at=now() WHERE user_id=$1 AND revoked_at IS NULL', [claims.sub]); } return {}; });
+
+// ===========================================================================
+// Ilova foydalanuvchisi hisobi — grafik (naqsh) parol
+// ===========================================================================
+// Ro'yxatdan o'tish ataylab yengil: email ham, telefon ham so'ralmaydi.
+// SMS tasdiqlash pul turadi va qishloqdagi foydalanuvchi uchun keraksiz
+// to'siq bo'lardi. Shaxs belgisi — foydalanuvchi nomi, kalit — naqsh.
+
+const AVATAR_LIMITS = {
+  maxSizeBytes: 2 * 1024 * 1024,
+  allowedMimeTypes: ['image/jpeg', 'image/png', 'image/webp'] as const,
+};
+
+function mapAppUser(row: QueryResultRow) {
+  return {
+    id: row.id,
+    username: row.username,
+    displayName: row.display_name ?? row.full_name,
+    avatarUrl: row.avatar_path ? `${config.publicBaseUrl}/v3/app/users/${row.id}/avatar` : null,
+    isBlocked: Boolean(row.blocked_at),
+    blockedReason: row.blocked_reason ?? null,
+    createdAt: iso(row.created_at),
+    lastSeenAt: iso(row.last_seen_at),
+  };
+}
+
+/**
+ * Tokendan foydalanuvchini oladi va hisob holatini tekshiradi.
+ *
+ * Holat har so'rovda bazadan o'qiladi. Token 30 kun amal qiladi, shuning
+ * uchun bloklashni faqat tokenga tayanib amalga oshirib bo'lmaydi —
+ * bloklangan odam tokeni tugagunicha ishlatishda davom etardi.
+ */
+async function requireAppUser(request: FastifyRequest, reply: FastifyReply): Promise<QueryResultRow | null> {
+  const authorization = request.headers.authorization;
+  if (!authorization?.startsWith('Bearer ')) {
+    apiError(reply, 401, 'unauthorized', 'Avval hisobingizga kiring.');
+    return null;
+  }
+  let userId: string;
+  try {
+    userId = (await verifyAppUserToken(authorization.slice(7))).sub;
+  } catch {
+    apiError(reply, 401, 'unauthorized', 'Sessiya muddati tugadi. Qaytadan kiring.');
+    return null;
+  }
+  const found = await db.query(`SELECT * FROM users WHERE id=$1::uuid AND kind='app'`, [userId]);
+  const user = found.rows[0];
+  if (!user) {
+    apiError(reply, 401, 'unauthorized', 'Hisob topilmadi.');
+    return null;
+  }
+  if (user.blocked_at) {
+    apiError(reply, 403, 'account_blocked', `Hisobingiz bloklangan. Sabab: ${user.blocked_reason ?? 'ko‘rsatilmagan'}`);
+    return null;
+  }
+  // "Oxirgi faollik" adminga kim ilovadan foydalanayotganini ko'rsatadi.
+  // Yozuv javobni kutib turmasligi kerak, shuning uchun kutilmaydi.
+  void db.query('UPDATE users SET last_seen_at = now() WHERE id = $1::uuid', [userId])
+    .catch((error: unknown) => app.log.warn(error, 'Faollik vaqti yangilanmadi'));
+  return user;
+}
+
+app.post('/v3/app/auth/register', async (request, reply) => {
+  if (!(await enforceRateLimit(request, reply, 'app-register', 5, 60 * 60))) return;
+  const body = asObject(request.body);
+  let username: string; let displayName: string; let pattern: string;
+  try {
+    username = normalizeUsername(body.username);
+    displayName = normalizeDisplayName(body.displayName, username);
+    pattern = normalizePattern(body.pattern);
+  } catch (error) {
+    if (error instanceof PatternValidationError) {
+      return apiError(reply, 422, 'validation_failed', error.message, { [error.field]: [error.message] });
+    }
+    throw error;
+  }
+  if (isTooSimplePattern(pattern)) {
+    return apiError(reply, 422, 'validation_failed', 'Bu naqsh juda oddiy. Boshqacha chizing.', {
+      pattern: ['Bu naqsh juda oddiy. Boshqacha chizing.'],
+    });
+  }
+
+  const taken = await db.query('SELECT 1 FROM users WHERE username=$1 LIMIT 1', [username]);
+  if (taken.rows[0]) {
+    return apiError(reply, 409, 'conflict', 'Bu foydalanuvchi nomi band. Boshqasini tanlang.', {
+      username: ['Bu foydalanuvchi nomi band.'],
+    });
+  }
+
+  const patternHash = await bcrypt.hash(pattern, 10);
+  const created = await db.query(
+    `INSERT INTO users (full_name, display_name, username, pattern_hash, kind, installation_id)
+     VALUES ($1,$1,$2,$3,'app',$4) RETURNING *`,
+    [displayName, username, patternHash, asString(asObject(body.device).installationId) || null],
+  );
+  const user = created.rows[0];
+  const { token, expiresAt } = await signAppUserToken(user.id);
+  return reply.status(201).send({ user: mapAppUser(user), accessToken: token, accessTokenExpiresAt: expiresAt });
+});
+
+app.post('/v3/app/auth/login', async (request, reply) => {
+  if (!(await enforceRateLimit(request, reply, 'app-login', 20, 15 * 60))) return;
+  const body = asObject(request.body);
+  let username: string; let pattern: string;
+  try {
+    username = normalizeUsername(body.username);
+    pattern = normalizePattern(body.pattern);
+  } catch {
+    // Kirishda qaysi maydon xato ekanini aytmaymiz: bu foydalanuvchi nomini
+    // taxmin qilib topishga yordam berardi.
+    return apiError(reply, 401, 'unauthorized', 'Foydalanuvchi nomi yoki naqsh noto‘g‘ri.');
+  }
+
+  const found = await db.query(`SELECT * FROM users WHERE username=$1 AND kind='app'`, [username]);
+  const user = found.rows[0];
+  const now = new Date();
+  const lockedMs = user ? remainingLockMs(user.locked_until, now) : 0;
+  if (lockedMs > 0) {
+    return apiError(reply, 429, 'account_locked', `Juda ko‘p urinish bo‘ldi. ${Math.ceil(lockedMs / 60_000)} daqiqadan so‘ng qayta urinib ko‘ring.`);
+  }
+
+  // Naqsh variantlari kam, shuning uchun mos kelmagan har bir urinish
+  // sanaladi va beshinchisidan keyin hisob vaqtincha qulflanadi.
+  const matches = user?.pattern_hash ? await bcrypt.compare(pattern, user.pattern_hash) : false;
+  if (!user || !matches) {
+    if (user) {
+      const nextCount = Number(user.failed_login_count ?? 0) + 1;
+      const lock = lockStateFor(nextCount, now);
+      await db.query('UPDATE users SET failed_login_count=$2, locked_until=$3 WHERE id=$1::uuid', [user.id, nextCount, lock.until]);
+    }
+    return apiError(reply, 401, 'unauthorized', 'Foydalanuvchi nomi yoki naqsh noto‘g‘ri.');
+  }
+  if (user.blocked_at) {
+    return apiError(reply, 403, 'account_blocked', `Hisobingiz bloklangan. Sabab: ${user.blocked_reason ?? 'ko‘rsatilmagan'}`);
+  }
+
+  await db.query('UPDATE users SET failed_login_count=0, locked_until=NULL, last_login_at=now(), last_seen_at=now() WHERE id=$1::uuid', [user.id]);
+  const { token, expiresAt } = await signAppUserToken(user.id);
+  return { user: mapAppUser(user), accessToken: token, accessTokenExpiresAt: expiresAt };
+});
+
+app.get('/v3/app/me', async (request, reply) => {
+  const user = await requireAppUser(request, reply);
+  if (!user) return;
+  return { user: mapAppUser(user) };
+});
+
+app.patch('/v3/app/me', async (request, reply) => {
+  const user = await requireAppUser(request, reply);
+  if (!user) return;
+  const body = asObject(request.body);
+  let displayName: string;
+  try {
+    displayName = normalizeDisplayName(body.displayName, String(user.username));
+  } catch (error) {
+    if (error instanceof PatternValidationError) {
+      return apiError(reply, 422, 'validation_failed', error.message, { [error.field]: [error.message] });
+    }
+    throw error;
+  }
+  const updated = await db.query('UPDATE users SET display_name=$2, full_name=$2 WHERE id=$1::uuid RETURNING *', [user.id, displayName]);
+  return { user: mapAppUser(updated.rows[0]) };
+});
+
+app.post('/v3/app/me/avatar', async (request, reply) => {
+  const user = await requireAppUser(request, reply);
+  if (!user) return;
+  if (!(await enforceRateLimit(request, reply, 'app-avatar', 10, 60 * 60))) return;
+
+  const file = await request.file();
+  if (!file) return apiError(reply, 422, 'validation_failed', 'Rasm fayli topilmadi.');
+  if (!AVATAR_LIMITS.allowedMimeTypes.includes(file.mimetype as never)) {
+    return apiError(reply, 415, 'unsupported_media_type', 'Faqat JPG, PNG yoki WEBP rasm yuklash mumkin.');
+  }
+  const buffer = await file.toBuffer();
+  if (!buffer.length || buffer.length > AVATAR_LIMITS.maxSizeBytes) {
+    return apiError(reply, 413, 'payload_too_large', 'Rasm hajmi 2 MB dan oshmasligi kerak.');
+  }
+
+  const stored = await storeAudio(buffer, `avatar-${user.id}.${file.mimetype.split('/')[1]}`, file.mimetype);
+  const previous = user.avatar_path ? { bucket: 'local', key: String(user.avatar_path) } : null;
+  const updated = await db.query(
+    'UPDATE users SET avatar_path=$2, avatar_mime=$3, avatar_updated_at=now() WHERE id=$1::uuid RETURNING *',
+    [user.id, stored.key, file.mimetype],
+  );
+  // Eski rasm yangisi yozilgandan keyin o'chiriladi: aks holda yozish
+  // muvaffaqiyatsiz tugasa foydalanuvchi rasmsiz qolardi.
+  if (previous) await deleteStoredAudio(previous).catch(() => undefined);
+  return { user: mapAppUser(updated.rows[0]) };
+});
+
+/**
+ * Profil rasmi. Ochiq: rasm jamoada ko'rinishi uchun qo'yiladi va uni
+ * ko'rsatish tokensiz bo'lishi kerak (izohlar ro'yxati, hissa qo'shganlar).
+ * Bloklangan hisob rasmi berilmaydi.
+ */
+app.get('/v3/app/users/:id/avatar', async (request, reply) => {
+  const id = asString((request.params as Json).id);
+  if (!isUuid(id)) return apiError(reply, 404, 'not_found', 'Foydalanuvchi topilmadi.');
+  const found = await db.query(`SELECT avatar_path, avatar_mime, blocked_at FROM users WHERE id=$1::uuid AND kind='app'`, [id]);
+  const row = found.rows[0];
+  if (!row?.avatar_path || row.blocked_at) return apiError(reply, 404, 'not_found', 'Profil rasmi yo‘q.');
+
+  const uploadRoot = resolve(config.uploadDir);
+  const avatarPath = resolve(uploadRoot, String(row.avatar_path));
+  // Kalit bazadan kelsa ham yo'lni tekshiramiz: saqlash katalogidan
+  // tashqariga chiqadigan kalit hech qachon o'qilmasligi kerak.
+  if (avatarPath !== uploadRoot && !avatarPath.startsWith(uploadRoot + sep)) {
+    return apiError(reply, 404, 'not_found', 'Profil rasmi yo‘q.');
+  }
+  try {
+    const image = await readFile(avatarPath);
+    // Turi bazadan olinadi. Eski yozuvda bo'lmasa JPEG deb faraz qilamiz —
+    // bu faqat `avatar_mime` qo'shilishidan oldingi rasmlar uchun.
+    const mime = AVATAR_LIMITS.allowedMimeTypes.includes(String(row.avatar_mime) as never)
+      ? String(row.avatar_mime)
+      : 'image/jpeg';
+    return reply.header('Content-Type', mime).header('Cache-Control', 'private, max-age=300').send(image);
+  } catch {
+    return apiError(reply, 404, 'not_found', 'Profil rasmi yo‘q.');
+  }
+});
+
+// --- Admin: foydalanuvchilarni kuzatish va bloklash ------------------------
+
+app.get('/v3/admin/app-users', async (request, reply) => {
+  const claims = await requirePermission(request, reply, 'users:manage');
+  if (!claims) return;
+  const query = request.query as Json;
+  const params: unknown[] = [];
+  const filters = [`kind='app'`];
+  if (query.search) {
+    params.push(`%${asString(query.search)}%`);
+    filters.push(`(username ILIKE $${params.length} OR display_name ILIKE $${params.length})`);
+  }
+  if (query.status === 'blocked') filters.push('blocked_at IS NOT NULL');
+  if (query.status === 'active') filters.push('blocked_at IS NULL');
+
+  const current = page(query.page); const size = pageSize(query.pageSize);
+  const where = `WHERE ${filters.join(' AND ')}`;
+  const count = await db.query(`SELECT count(*)::int AS total FROM users ${where}`, params);
+  params.push(size, (current - 1) * size);
+  const users = await db.query(
+    `SELECT u.*,
+       (SELECT count(*)::int FROM contribution_requests cr WHERE cr.submitted_by_user_id = u.id) AS contribution_count,
+       (SELECT count(*)::int FROM word_comments wc WHERE wc.author_user_id = u.id) AS comment_count
+     FROM users u ${where} ORDER BY u.created_at DESC LIMIT $${params.length - 1} OFFSET $${params.length}`,
+    params,
+  );
+  const total = count.rows[0].total;
+  return {
+    items: users.rows.map((row) => ({
+      ...mapAppUser(row),
+      contributionCount: row.contribution_count,
+      commentCount: row.comment_count,
+    })),
+    meta: { page: current, pageSize: size, total, totalPages: Math.ceil(total / size) },
+  };
+});
+
+app.patch('/v3/admin/app-users/:id/block', async (request, reply) => {
+  const claims = await requirePermission(request, reply, 'users:manage');
+  if (!claims) return;
+  const id = asString((request.params as Json).id);
+  if (!isUuid(id)) return apiError(reply, 404, 'not_found', 'Foydalanuvchi topilmadi.');
+  const body = asObject(request.body);
+  const blocked = bool(body.blocked);
+  const reason = asString(body.reason);
+  // Bloklash ham, blokdan chiqarish ham auditga tushadi va ikkalasi ham
+  // sababsiz bo'lmaydi — keyin "nega bloklangan edi" degan savolga javob
+  // faqat shu yozuvdan topiladi.
+  if (!reason) return apiError(reply, 422, 'validation_failed', 'Sabab kiritilishi shart.', { reason: ['Sabab kiritilishi shart.'] });
+
+  const updated = await db.query(
+    `UPDATE users SET
+       blocked_at = CASE WHEN $2 THEN now() ELSE NULL END,
+       blocked_reason = CASE WHEN $2 THEN $3 ELSE NULL END,
+       blocked_by_user_id = CASE WHEN $2 THEN $4::uuid ELSE NULL END
+     WHERE id=$1::uuid AND kind='app' RETURNING *`,
+    [id, blocked, reason, claims.sub],
+  );
+  if (!updated.rows[0]) return apiError(reply, 404, 'not_found', 'Foydalanuvchi topilmadi.');
+  const auditLogId = await audit(claims, blocked ? 'app_user.block' : 'app_user.unblock', 'user', id, reason, { blocked }, request);
+  return { user: mapAppUser(updated.rows[0]), auditLogId };
+});
 
 app.get('/v3/regions', async (request) => {
   const query = request.query as Json; const params: unknown[] = []; const filters: string[] = [];
