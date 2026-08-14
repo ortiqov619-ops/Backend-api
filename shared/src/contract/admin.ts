@@ -68,7 +68,9 @@ export type AuditAction =
   | 'dialect.update'
   | 'integration.update'
   | 'integration.rotate'
-  | 'user.role_change';
+  | 'user.role_change'
+  | 'app_user.block'
+  | 'app_user.unblock';
 
 export type AuditEntityType =
   | 'user'
