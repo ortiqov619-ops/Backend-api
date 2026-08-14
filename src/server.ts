@@ -37,6 +37,7 @@ import {
   verifyAccessToken,
   verifyAudioPlaybackToken,
 } from './security';
+import { INSERT_VALIDATION_RESULT, jsonb, UPDATE_REQUEST_RESOLUTION } from './sql';
 
 assertProductionConfig();
 const db = new Pool({ connectionString: config.databaseUrl, ssl: process.env.DATABASE_SSL === 'true' ? { rejectUnauthorized: false } : undefined });
@@ -828,7 +829,7 @@ app.post('/v3/contributions/words', async (request, reply) => {
   const created = await db.query(`INSERT INTO contribution_requests (payload, device, idempotency_key, latitude, longitude, location_accuracy_m, location_checked_at, submission_location_status, matched_geofence_id, geofence_version, distance_to_boundary_m, is_location_mocked, validation_verdict, validation_score, requires_human_review)
     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id`, [payload, { ...device, heritageDeclaration }, key, hasLocation ? location.latitude : null, hasLocation ? location.longitude : null, hasLocation ? location.accuracy : null, hasLocation ? location.capturedAt : null, hasLocation ? gate?.status ?? 'not_provided' : 'not_provided', gate?.matchedGeofenceId ?? null, geofences.find((f) => f.id === gate?.matchedGeofenceId)?.version ?? null, gate?.distanceToBoundaryM ?? null, hasLocation ? location.isMocked ?? null : null, validation.verdict, validation.score, true]);
   const requestId = created.rows[0].id;
-  await db.query('INSERT INTO validation_results (contribution_request_id, subject, verdict, score, confidence, reasons, engine_kind, engine_name, engine_version, origin, geofence_version) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)', [requestId, validation.subject, validation.verdict, validation.score, validation.confidence, validation.reasons, validation.engine.kind, validation.engine.name, validation.engine.version, validation.origin, geofences.find((f) => f.id === gate?.matchedGeofenceId)?.version ?? null]);
+  await db.query(INSERT_VALIDATION_RESULT, [requestId, validation.subject, validation.verdict, validation.score, validation.confidence, jsonb(validation.reasons), validation.engine.kind, validation.engine.name, validation.engine.version, validation.origin, geofences.find((f) => f.id === gate?.matchedGeofenceId)?.version ?? null]);
   const record = await db.query(`${requestSql} WHERE cr.id=$1`, [requestId]); return {
     request: await mapRequest(record.rows[0]),
     userMessage: proposedRegion
@@ -1167,11 +1168,8 @@ app.patch('/v3/requests/:id/status', async (request, reply) => {
       const createdWord = await client.query(`INSERT INTO words (word, literary_form, meaning, example, category, phonetic_key, status, region_id, district_id, village_id, dialect_id, clan, dialect_score, source_request_id) VALUES ($1,$2,$3,$4,$5,$6,'published',$7,$8,$9,$10,$11,$12,$13) RETURNING id`, [published.word, published.literaryForm ?? null, published.meaning, published.example ?? null, published.category ?? null, phoneticKey(String(published.word)), published.regionId ?? null, published.districtId ?? null, published.villageId ?? null, published.dialectId ?? null, published.clan ?? null, previous.validation_score, id]);
       wordId = createdWord.rows[0].id;
     }
-    // `$2` uch joyda ishlatiladi. Cast bo'lmasa PostgreSQL uni bir joyda
-    // `moderation_status`, boshqasida `text` deb deduksiya qiladi va prepared
-    // statement `42P08 inconsistent types deduced for parameter $2` bilan
-    // yiqiladi — audio va so'z tasdiqlashdagi `500` ning aynan sababi shu edi.
-    await client.query(`UPDATE contribution_requests SET status=$2::moderation_status, payload=$3, clarification_note=$4, resolved_at=CASE WHEN $2::moderation_status='needs_clarification' THEN NULL ELSE now() END, resolved_by_user_id=CASE WHEN $2::moderation_status='needs_clarification' THEN NULL ELSE $5 END, result_word_id=$6 WHERE id=$1`, [id,status,storedPayload,reason || null,claims.sub,wordId]);
+    // Parametr turlari nozik — izohi `sql.ts` da.
+    await client.query(UPDATE_REQUEST_RESOLUTION, [id, status, jsonb(storedPayload), reason || null, claims.sub, wordId]);
     if (bool(body.applyToAudio)) {
       // So'z bo'yicha aniqlashtirish so'ralganda audio baholanmagan bo'lib
       // qoladi: aks holda u navbatdan tushib ketadi va qayta ko'rilmaydi.
