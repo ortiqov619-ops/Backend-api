@@ -775,6 +775,49 @@ app.post('/v3/app/auth/login', async (request, reply) => {
   return { user: mapAppUser(user), accessToken: token, accessTokenExpiresAt: expiresAt };
 });
 
+/**
+ * Ilova uchun ochiq imkoniyatlar ro'yxati.
+ *
+ * Ba'zi funksiyalar tashqi xizmatga bog'liq (masalan nutqni matnga
+ * o'girish). Xizmat ulanmagan bo'lsa, ularning tugmasi ekranda turishi
+ * foydalanuvchini ham, moderatorni ham chalg'itadi: bosiladi, lekin hech
+ * narsa bo'lmaydi. Shuning uchun ilova ekranni chizishdan oldin shu
+ * ro'yxatni so'raydi va faqat haqiqatan ishlaydigan imkoniyatlarni
+ * ko'rsatadi.
+ *
+ * Bu yerda hech qanday sir qaytmaydi — faqat "bor" yoki "yo'q". Shu sabab
+ * endpoint ochiq: token talab qilinsa, ilova hisobsiz foydalanuvchida
+ * ekranni to'g'ri chiza olmasdi.
+ *
+ * Imkoniyat "bor" hisoblanishi uchun uchta shart bir vaqtda bajarilishi
+ * kerak: serverda uning mijozi yozilgan bo'lsin, admin uni yoqgan bo'lsin
+ * va kalit kiritilgan bo'lsin. Kalitsiz yoqilgan integratsiya ishlamaydi,
+ * shuning uchun u ham "yo'q" deb qaytadi.
+ */
+app.get('/v3/app/features', async () => {
+  const rows = await db.query(
+    `SELECT provider::text AS provider, is_enabled, health::text AS health,
+            (secret_ciphertext IS NOT NULL) AS has_secret
+       FROM integration_secrets`,
+  );
+  const live = new Set(
+    rows.rows
+      .filter((row) => SUPPORTED_INTEGRATIONS.has(String(row.provider)))
+      .filter((row) => row.is_enabled && row.has_secret && row.health !== 'failing')
+      .map((row) => String(row.provider)),
+  );
+  return {
+    features: {
+      /** Yozilgan ovozni matnga o'girish. */
+      transcription: live.has('stt_primary'),
+      /** Push bildirishnomalar — serverda mijozi hali yozilmagan. */
+      pushNotifications: live.has('push_notifications'),
+      /** Sheva mosligini avtomatik baholash — serverda mijozi yo'q. */
+      dialectScoring: live.has('dialect_model'),
+    },
+  };
+});
+
 app.get('/v3/app/me', async (request, reply) => {
   const user = await requireAppUser(request, reply);
   if (!user) return;
