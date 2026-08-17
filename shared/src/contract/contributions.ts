@@ -1,6 +1,7 @@
 import type { Auditable, IsoDateTime, PageQuery, Paginated, Uuid } from './common';
 import type { AudioSubmission } from './audio';
 import type { LocationSample, SubmissionLocationStatus } from './geo';
+import type { ContributorProfile, ModeratorProfile } from './profile';
 import type { ValidationResult, ValidationVerdict } from './validation';
 
 export type ContributionType = 'word' | 'audio' | 'correction';
@@ -47,6 +48,14 @@ export interface ContributionRequest extends Auditable {
   payload: ContributionPayload;
   submittedByUserId?: Uuid | null;
   submittedByDisplayName?: string | null;
+  /**
+   * Hissa qo'shgan hisobning to'liq profili.
+   *
+   * Server uni `submitted_by_user_id` bo'yicha `users` dan qo'shib beradi,
+   * shuning uchun ism/rasm o'zgarsa moderator darhol yangisini ko'radi.
+   * Hisobsiz (mehmon) yuborilgan takliflarda `null`.
+   */
+  submitter?: ContributorProfile | null;
   device?: DeviceContext | null;
 
   // --- lokatsiya ---
@@ -68,9 +77,42 @@ export interface ContributionRequest extends Auditable {
   clarificationNote?: string | null;
   resolvedAt?: IsoDateTime | null;
   resolvedByUserId?: Uuid | null;
+  /** Qarorni qabul qilgan moderator — id emas, ko'rsatiladigan profil. */
+  resolvedBy?: ModeratorProfile | null;
   /** Tasdiqlanganda yaratilgan/yangilangan so'z. */
   resultWordId?: Uuid | null;
 }
+
+/**
+ * Foydalanuvchining o'z takliflari ro'yxati (`GET /app/contributions`).
+ *
+ * Moderator ko'radigan to'liq yozuvdan ataylab qisqa: lokatsiya isboti,
+ * qurilma ma'lumoti va avtomatik filtr tafsilotlari boshqa odamning
+ * ishi va foydalanuvchiga kerak emas.
+ */
+export interface MyContribution {
+  id: Uuid;
+  word: string;
+  meaning: string;
+  status: ModerationStatus;
+  /** Moderator yozgan sabab/izoh — rad etish va aniqlashtirishda ko'rsatiladi. */
+  moderationNote?: string | null;
+  /** Qarorni kim qabul qilgani. */
+  resolvedBy?: ModeratorProfile | null;
+  resolvedAt?: IsoDateTime | null;
+  /** Tasdiqlangan bo'lsa — lug'atdagi so'z. */
+  resultWordId?: Uuid | null;
+  hasAudio: boolean;
+  audioStatus?: ModerationStatus | null;
+  createdAt: IsoDateTime;
+  updatedAt: IsoDateTime;
+}
+
+export interface MyContributionListQuery extends PageQuery {
+  status?: ModerationStatus;
+}
+
+export type MyContributionListResponse = Paginated<MyContribution>;
 
 /** POST /contributions/words */
 export interface CreateWordContributionRequest {

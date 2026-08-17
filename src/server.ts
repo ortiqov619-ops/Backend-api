@@ -18,6 +18,19 @@ import {
 import { assertProductionConfig, config } from './config';
 import { translateDatabaseError } from './db-errors';
 import {
+  audioDecisionNotification,
+  audioSubmissionNotification,
+  commentNotification,
+  deliver as deliverNotifications,
+  likeNotification,
+  moderationRecipients,
+  replyNotification,
+  submissionNotification,
+  unreadCount as unreadNotificationCount,
+  wordDecisionNotification,
+  type NotificationDraft,
+} from './notifications';
+import {
   canBeChildOf,
   canCreateRegionUnder,
   isDirectVillageChild,
@@ -49,6 +62,7 @@ import {
   remainingLockMs,
 } from './pattern-auth';
 import { INSERT_VALIDATION_RESULT, jsonb, UPDATE_REQUEST_RESOLUTION } from './sql';
+import { iso, requiredIso } from './timestamps';
 
 assertProductionConfig();
 const db = new Pool({ connectionString: config.databaseUrl, ssl: process.env.DATABASE_SSL === 'true' ? { rejectUnauthorized: false } : undefined });
@@ -75,8 +89,8 @@ class RouteFault extends Error {
   }
 }
 
-function iso(value: unknown): string | null { return value ? new Date(String(value)).toISOString() : null; }
-function requiredIso(value: unknown): string { return new Date(String(value)).toISOString(); }
+// Vaqt qiymatlari `timestamps.ts` da: u yerda nima uchun `Date` bevosita
+// ishlatilishi va bu optimistik qulf uchun nega muhimligi izohlangan.
 function page(input: unknown, fallback = 1): number { const value = Number(input ?? fallback); return Number.isFinite(value) ? Math.max(1, Math.floor(value)) : fallback; }
 function pageSize(input: unknown): number { return Math.min(100, Math.max(1, page(input, 20))); }
 function apiError(reply: FastifyReply, status: number, code: string, message: string, fields?: Record<string, string[]>) {
@@ -197,7 +211,44 @@ function mapDialect(row: QueryResultRow) {
   return { id: row.id, code: row.code, nameUz: row.name_uz, description: row.description, markerWords: row.marker_words ?? [], regionIds: row.region_ids ?? [], isActive: row.is_active, createdAt: iso(row.created_at), updatedAt: iso(row.updated_at) };
 }
 function mapWord(row: QueryResultRow) {
-  return { id: row.id, word: row.word, literaryForm: row.literary_form, meaning: row.meaning, example: row.example, category: row.category, phoneticKey: row.phonetic_key, status: row.status, regionId: row.region_id, districtId: row.district_id, villageId: row.village_id, dialectId: row.dialect_id, clan: row.clan, dialectScore: row.dialect_score, sourceRequestId: row.source_request_id, archivedAt: iso(row.archived_at), archiveReason: row.archive_reason, createdAt: iso(row.created_at), updatedAt: iso(row.updated_at) };
+  return { id: row.id, word: row.word, literaryForm: row.literary_form, meaning: row.meaning, example: row.example, category: row.category, phoneticKey: row.phonetic_key, status: row.status, regionId: row.region_id, districtId: row.district_id, villageId: row.village_id, dialectId: row.dialect_id, clan: row.clan, dialectScore: row.dialect_score, sourceRequestId: row.source_request_id, hasAudio: Boolean(row.has_audio), createdBy: row.created_by ?? null, archivedAt: iso(row.archived_at), archiveReason: row.archive_reason, createdAt: iso(row.created_at), updatedAt: iso(row.updated_at) };
+}
+
+/**
+ * So'zga tegishli tasdiqlangan talaffuz.
+ *
+ * Audio ikki yo'l bilan bog'lanadi: to'g'ridan-to'g'ri lug'at so'ziga
+ * (`word_id`) yoki shu so'z chiqqan taklifga (`contribution_request_id`).
+ * Ikkinchisi odatiy holat — foydalanuvchi so'z bilan birga talaffuz
+ * yuboradi va so'z keyin tasdiqdan chiqadi. Faqat birinchi shart
+ * tekshirilganda lug'atdagi audiolarning ko'pchiligi ko'rinmay qolardi.
+ */
+const WORD_AUDIO_MATCH_SQL = `au.superseded_at IS NULL
+  AND au.moderation_status = 'approved'
+  AND (au.word_id = w.id OR au.contribution_request_id = w.source_request_id)`;
+
+const WORD_HAS_AUDIO_SQL = `EXISTS (SELECT 1 FROM audio_submissions au WHERE ${WORD_AUDIO_MATCH_SQL})`;
+
+async function primaryAudioFor(wordId: string): Promise<{ id: string; playbackUrl: string; playbackUrlExpiresAt: string; durationMs: number; mimeType: string } | null> {
+  const found = await db.query(
+    `SELECT au.* FROM audio_submissions au
+       JOIN words w ON w.id = $1
+      WHERE ${WORD_AUDIO_MATCH_SQL}
+      ORDER BY au.created_at DESC, au.id DESC
+      LIMIT 1`,
+    [wordId],
+  );
+  const row = found.rows[0];
+  if (!row) return null;
+  try {
+    const playback = await createPlaybackAccess(row);
+    return { id: String(row.id), durationMs: Number(row.duration_ms), mimeType: String(row.mime_type), ...playback };
+  } catch (error: unknown) {
+    // Bulut storage javob bermasa so'zning o'zi baribir ochilishi kerak:
+    // pleyer yo'q bo'ladi, lekin ekran ishlaydi.
+    app.log.warn({ err: error, wordId }, 'Talaffuz havolasi yaratilmadi');
+    return null;
+  }
 }
 async function activeFences() { const result = await db.query('SELECT * FROM geofences WHERE is_active = true'); return result.rows.map(mapFence); }
 
@@ -459,11 +510,23 @@ function audioContext(row: QueryResultRow) {
 
 async function mapRequest(row: QueryResultRow) {
   const audio = row.audio_id ? await mapAudioSubmission(row) : null;
-  return { id: row.id, type: row.type, status: row.status, payload: row.payload, submittedByUserId: row.submitted_by_user_id, submittedByDisplayName: row.submitted_by_display_name, device: row.device, latitude: row.latitude, longitude: row.longitude, locationAccuracyM: row.location_accuracy_m, locationCheckedAt: iso(row.location_checked_at), submissionLocationStatus: row.submission_location_status, matchedGeofenceId: row.matched_geofence_id, geofenceVersion: row.geofence_version, validationVerdict: row.validation_verdict, validationScore: row.validation_score, validationResults: row.validation_results ?? [], audio, clarificationNote: row.clarification_note, resolvedAt: iso(row.resolved_at), resolvedByUserId: row.resolved_by_user_id, resultWordId: row.result_word_id, createdAt: iso(row.created_at), updatedAt: iso(row.updated_at) };
+  return { id: row.id, type: row.type, status: row.status, payload: row.payload, submittedByUserId: row.submitted_by_user_id, submittedByDisplayName: row.submitted_by_display_name, submitter: mapContributorProfile(row), device: row.device, latitude: row.latitude, longitude: row.longitude, locationAccuracyM: row.location_accuracy_m, locationCheckedAt: iso(row.location_checked_at), submissionLocationStatus: row.submission_location_status, matchedGeofenceId: row.matched_geofence_id, geofenceVersion: row.geofence_version, validationVerdict: row.validation_verdict, validationScore: row.validation_score, validationResults: row.validation_results ?? [], audio, clarificationNote: row.clarification_note, resolvedAt: iso(row.resolved_at), resolvedByUserId: row.resolved_by_user_id, resolvedBy: mapModeratorProfile(row), resultWordId: row.result_word_id, createdAt: iso(row.created_at), updatedAt: iso(row.updated_at) };
 }
 const requestSql = `SELECT cr.*, a.id AS audio_id, a.contribution_request_id AS audio_contribution_request_id, a.word_id AS audio_word_id, a.storage_bucket, a.storage_key, a.mime_type, a.duration_ms, a.size_bytes, a.sample_rate_hz, a.checksum_sha256, a.expected_text, a.analysis_status, a.pipeline_stage, a.transcript, a.transcript_confidence, a.detected_language, a.dialect_confidence, a.pronunciation_similarity, a.text_audio_match, a.overall_score, a.analysis_reasons, a.requires_human_review AS audio_requires_review, a.engine_name AS audio_engine_name, a.engine_version AS audio_engine_version, a.engine_provider AS audio_engine_provider, a.failure_message AS audio_failure_message, a.moderation_status AS audio_moderation_status, a.version AS audio_version, a.superseded_at AS audio_superseded_at, a.analyzed_at, a.created_at AS audio_created_at, a.updated_at AS audio_updated_at,
-  COALESCE((SELECT jsonb_agg(jsonb_build_object('subject', vr.subject, 'verdict', vr.verdict, 'score', vr.score, 'confidence', vr.confidence, 'reasons', vr.reasons, 'origin', vr.origin, 'evaluatedAt', vr.evaluated_at)) FROM validation_results vr WHERE vr.contribution_request_id = cr.id), '[]'::jsonb) AS validation_results
+  COALESCE((SELECT jsonb_agg(jsonb_build_object('subject', vr.subject, 'verdict', vr.verdict, 'score', vr.score, 'confidence', vr.confidence, 'reasons', vr.reasons, 'origin', vr.origin, 'evaluatedAt', vr.evaluated_at)) FROM validation_results vr WHERE vr.contribution_request_id = cr.id), '[]'::jsonb) AS validation_results,
+  -- Hissa qo'shuvchi va qaror qabul qilgan moderator id sifatida emas,
+  -- profil sifatida qaytadi. Ilgari moderator faqat uuid ko'rar edi va
+  -- kim yuborganini umuman bilib bo'lmasdi.
+  su.id AS submitter_id, su.username AS submitter_username, su.display_name AS submitter_display_name,
+  su.full_name AS submitter_full_name, su.avatar_path AS submitter_avatar_path,
+  su.blocked_at AS submitter_blocked_at, su.created_at AS submitter_created_at,
+  su.last_seen_at AS submitter_last_seen_at,
+  (SELECT count(*)::int FROM contribution_requests prior WHERE prior.submitted_by_user_id = su.id) AS submitter_contribution_count,
+  mu.id AS moderator_id, mu.full_name AS moderator_full_name,
+  COALESCE((SELECT array_agg(role.code) FROM user_roles link JOIN roles role ON role.id = link.role_id WHERE link.user_id = mu.id), '{}') AS moderator_roles
 FROM contribution_requests cr
+LEFT JOIN users su ON su.id = cr.submitted_by_user_id
+LEFT JOIN users mu ON mu.id = cr.resolved_by_user_id
 LEFT JOIN LATERAL (
   -- Faqat joriy versiya: almashtirilgan yozuv audit uchun qoladi, lekin
   -- moderatorga eski talaffuz ko'rsatilmaydi.
@@ -646,17 +709,142 @@ const AVATAR_LIMITS = {
   allowedMimeTypes: ['image/jpeg', 'image/png', 'image/webp'] as const,
 };
 
+function avatarUrl(userId: unknown, avatarPath: unknown): string | null {
+  return avatarPath ? `${config.publicBaseUrl}/v3/app/users/${String(userId)}/avatar` : null;
+}
+
 function mapAppUser(row: QueryResultRow) {
   return {
     id: row.id,
     username: row.username,
     displayName: row.display_name ?? row.full_name,
-    avatarUrl: row.avatar_path ? `${config.publicBaseUrl}/v3/app/users/${row.id}/avatar` : null,
+    avatarUrl: avatarUrl(row.id, row.avatar_path),
     isBlocked: Boolean(row.blocked_at),
     blockedReason: row.blocked_reason ?? null,
     createdAt: iso(row.created_at),
     lastSeenAt: iso(row.last_seen_at),
   };
+}
+
+/**
+ * Boshqa odamga ko'rsatiladigan profil.
+ *
+ * Bloklangan hisobning nomi va rasmi ochiq ro'yxatlarda ko'rsatilmaydi:
+ * bloklash sababi odatda aynan shu nom yoki rasm bo'ladi. Moderator uchun
+ * esa alohida, boyroq shakl (`mapContributorProfile`) bor.
+ */
+function mapPublicProfile(row: QueryResultRow | null | undefined, prefix = ''): {
+  id: string;
+  username: string;
+  displayName: string;
+  avatarUrl: string | null;
+} | null {
+  const id = row?.[`${prefix}id`];
+  if (!id) return null;
+  const blocked = Boolean(row?.[`${prefix}blocked_at`]);
+  if (blocked) {
+    return { id: String(id), username: 'bloklangan', displayName: 'Bloklangan hisob', avatarUrl: null };
+  }
+  return {
+    id: String(id),
+    username: String(row?.[`${prefix}username`] ?? ''),
+    displayName: String(row?.[`${prefix}display_name`] ?? row?.[`${prefix}full_name`] ?? ''),
+    avatarUrl: avatarUrl(id, row?.[`${prefix}avatar_path`]),
+  };
+}
+
+/** Moderator ko'radigan hissa qo'shuvchi: profil + qaror uchun kontekst. */
+function mapContributorProfile(row: QueryResultRow) {
+  if (!row.submitter_id) return null;
+  return {
+    id: String(row.submitter_id),
+    username: String(row.submitter_username ?? ''),
+    displayName: String(row.submitter_display_name ?? row.submitter_full_name ?? ''),
+    avatarUrl: avatarUrl(row.submitter_id, row.submitter_avatar_path),
+    isBlocked: Boolean(row.submitter_blocked_at),
+    contributionCount: Number(row.submitter_contribution_count ?? 0),
+    createdAt: iso(row.submitter_created_at),
+    lastSeenAt: iso(row.submitter_last_seen_at),
+  };
+}
+
+function mapModeratorProfile(row: QueryResultRow) {
+  if (!row.moderator_id) return null;
+  return {
+    id: String(row.moderator_id),
+    fullName: String(row.moderator_full_name ?? 'Administrator'),
+    roles: (row.moderator_roles as string[] | null) ?? [],
+  };
+}
+
+/**
+ * Tokendan ilova foydalanuvchisini oladi, lekin token yo'q bo'lsa xato
+ * qaytarmaydi.
+ *
+ * Hissa qo'shish hisobsiz ham mumkin bo'lib qolishi kerak — bu ataylab
+ * qo'yilgan past to'siq. Hisob bo'lsa, taklif unga bog'lanadi va
+ * foydalanuvchi qaror haqida xabar oladi; bo'lmasa avvalgidek anonim
+ * ketadi. Bloklangan hisob esa hech qanday holatda yozuv qoldirmaydi.
+ */
+async function optionalAppUser(request: FastifyRequest): Promise<QueryResultRow | null> {
+  const authorization = request.headers.authorization;
+  if (!authorization?.startsWith('Bearer ')) return null;
+  try {
+    const { sub } = await verifyAppUserToken(authorization.slice(7));
+    const found = await db.query(`SELECT * FROM users WHERE id=$1::uuid AND kind='app'`, [sub]);
+    const user = found.rows[0];
+    return user && !user.blocked_at ? user : null;
+  } catch {
+    return null;
+  }
+}
+
+function mapNotification(row: QueryResultRow) {
+  return {
+    id: String(row.id),
+    type: row.type,
+    title: row.title,
+    body: row.body,
+    entityType: row.entity_type,
+    entityId: row.entity_id ?? null,
+    data: row.data ?? {},
+    actor: mapPublicProfile(row, 'actor_'),
+    isRead: Boolean(row.read_at),
+    readAt: iso(row.read_at),
+    createdAt: requiredIso(row.created_at),
+  };
+}
+
+const NOTIFICATION_SELECT = `SELECT n.*,
+    actor.id AS actor_id, actor.username AS actor_username, actor.display_name AS actor_display_name,
+    actor.full_name AS actor_full_name, actor.avatar_path AS actor_avatar_path, actor.blocked_at AS actor_blocked_at
+  FROM notifications n
+  LEFT JOIN users actor ON actor.id = n.actor_user_id`;
+
+/**
+ * Navbatga oid xabarni barcha moderatorlarga yuboradi.
+ *
+ * Yozuv muvaffaqiyatsiz bo'lsa so'rov yiqilmaydi: foydalanuvchining taklifi
+ * allaqachon saqlangan va uni bildirishnoma sababli yo'qotish mumkin emas.
+ * Moderator baribir navbatni ekranda ko'radi, shuning uchun xato faqat
+ * logga tushadi.
+ */
+async function notifyModerators(
+  message: { type: NotificationDraft['type']; title: string; body: string },
+  entityType: NotificationDraft['entityType'],
+  entityId: string,
+  data: Record<string, unknown>,
+  actorUserId: string | null,
+): Promise<void> {
+  try {
+    const recipients = await moderationRecipients(db);
+    await deliverNotifications(
+      db,
+      recipients.map((recipientUserId) => ({ recipientUserId, actorUserId, entityType, entityId, data, ...message })),
+    );
+  } catch (error: unknown) {
+    app.log.warn({ err: error, entityId }, 'Moderator bildirishnomasi yozilmadi');
+  }
 }
 
 /**
@@ -900,6 +1088,526 @@ app.get('/v3/app/users/:id/avatar', async (request, reply) => {
   }
 });
 
+// ===========================================================================
+// Jamoa: yoqtirish, izoh, saqlash
+// ===========================================================================
+// O'qish ochiq — izohlar hisobsiz ham ko'rinadi. Yozish esa hisob talab
+// qiladi: anonim yoqtirish va izohni na hisoblab, na moderatsiya qilib
+// bo'ladi, va aynan shu narsa ilgari qurilma xotirasida "ishlayotgandek"
+// ko'rinardi.
+
+const COMMENT_SELECT = `SELECT c.id, c.word_id, c.body, c.parent_comment_id, c.author_user_id, c.created_at,
+    author.id AS author_id, author.username AS author_username, author.display_name AS author_display_name,
+    author.full_name AS author_full_name, author.avatar_path AS author_avatar_path, author.blocked_at AS author_blocked_at
+  FROM word_comments c
+  LEFT JOIN users author ON author.id = c.author_user_id`;
+
+/** Ko'rinadigan izoh: o'chirilmagan va moderator rad etmagan. */
+const VISIBLE_COMMENT_SQL = `c.deleted_at IS NULL AND c.status <> 'rejected'`;
+
+interface MappedComment {
+  id: string;
+  wordId: string;
+  body: string;
+  author: ReturnType<typeof mapPublicProfile>;
+  parentCommentId: string | null;
+  replies: MappedComment[];
+  canDelete: boolean;
+  createdAt: string;
+}
+
+function mapComment(row: QueryResultRow, viewerId: string | null): MappedComment {
+  return {
+    id: String(row.id),
+    wordId: String(row.word_id),
+    body: String(row.body),
+    author: mapPublicProfile(row, 'author_'),
+    parentCommentId: row.parent_comment_id ? String(row.parent_comment_id) : null,
+    replies: [],
+    // O'chirish huquqi serverda ham qayta tekshiriladi; bu bayroq faqat
+    // tugmani ko'rsatish uchun.
+    canDelete: Boolean(viewerId && row.author_user_id && String(row.author_user_id) === viewerId),
+    createdAt: requiredIso(row.created_at),
+  };
+}
+
+/**
+ * So'z izohlari, javoblari bilan birga.
+ *
+ * Sahifalash faqat asosiy izohlarga tegishli: javob o'z otasi bilan birga
+ * kelmasa, ekranda otasiz javob paydo bo'lardi. Javoblar bir daraja bilan
+ * cheklangan, shuning uchun ikkita so'rov yetarli.
+ */
+async function loadWordComments(
+  wordId: string,
+  viewerId: string | null,
+  current: number,
+  size: number,
+): Promise<{ items: MappedComment[]; total: number }> {
+  const counted = await db.query<{ total: number }>(
+    `SELECT count(*)::int AS total FROM word_comments c WHERE c.word_id=$1 AND c.parent_comment_id IS NULL AND ${VISIBLE_COMMENT_SQL}`,
+    [wordId],
+  );
+  const roots = await db.query(
+    `${COMMENT_SELECT} WHERE c.word_id=$1 AND c.parent_comment_id IS NULL AND ${VISIBLE_COMMENT_SQL}
+     ORDER BY c.created_at DESC LIMIT $2 OFFSET $3`,
+    [wordId, size, (current - 1) * size],
+  );
+  const items = roots.rows.map((row) => mapComment(row, viewerId));
+  if (items.length) {
+    const replies = await db.query(
+      `${COMMENT_SELECT} WHERE c.parent_comment_id = ANY($1::uuid[]) AND ${VISIBLE_COMMENT_SQL} ORDER BY c.created_at ASC`,
+      [items.map((item) => item.id)],
+    );
+    const byParent = new Map(items.map((item) => [item.id, item]));
+    for (const row of replies.rows) {
+      byParent.get(String(row.parent_comment_id))?.replies.push(mapComment(row, viewerId));
+    }
+  }
+  return { items, total: counted.rows[0]?.total ?? 0 };
+}
+
+/**
+ * Nashr etilgan so'z va uning ilova-muallifi.
+ *
+ * `owner_id` faqat `kind='app'` hisob uchun to'ladi. Sabab: administrator
+ * bevosita kiritgan so'zning `created_by` si xodim hisobi bo'ladi va
+ * yoqtirish/izoh xabarlari moderator inboxiga tushib, navbat xabarlarini
+ * ko'mib yuborardi.
+ */
+async function publishedWordOr404(reply: FastifyReply, wordId: string): Promise<QueryResultRow | null> {
+  if (!isUuid(wordId)) {
+    apiError(reply, 404, 'not_found', 'So‘z topilmadi.');
+    return null;
+  }
+  const found = await db.query(
+    `SELECT w.id, w.word, owner.id AS owner_id
+       FROM words w
+       LEFT JOIN users owner ON owner.id = w.created_by AND owner.kind = 'app' AND owner.blocked_at IS NULL
+      WHERE w.id=$1 AND w.status='published'`,
+    [wordId],
+  );
+  if (!found.rows[0]) {
+    apiError(reply, 404, 'not_found', 'So‘z topilmadi.');
+    return null;
+  }
+  return found.rows[0];
+}
+
+async function likesCountFor(wordId: string): Promise<number> {
+  const result = await db.query<{ total: number }>('SELECT count(*)::int AS total FROM word_likes WHERE word_id=$1', [wordId]);
+  return Number(result.rows[0]?.total ?? 0);
+}
+
+app.get('/v3/words/:id/community', async (request, reply) => {
+  const wordId = asString((request.params as Json).id);
+  const word = await publishedWordOr404(reply, wordId);
+  if (!word) return;
+  // Token ixtiyoriy: mehmon ham izohlarni o'qiydi, faqat "men yoqtirdim"
+  // va "men saqladim" bayroqlari `false` bo'ladi.
+  const viewer = await optionalAppUser(request);
+  const viewerId = viewer ? String(viewer.id) : null;
+  const [likes, mine, saved, comments] = await Promise.all([
+    likesCountFor(wordId),
+    viewerId
+      ? db.query('SELECT 1 FROM word_likes WHERE word_id=$1 AND user_id=$2::uuid LIMIT 1', [wordId, viewerId])
+      : Promise.resolve({ rows: [] as QueryResultRow[] }),
+    viewerId
+      ? db.query('SELECT 1 FROM word_saves WHERE word_id=$1 AND user_id=$2::uuid LIMIT 1', [wordId, viewerId])
+      : Promise.resolve({ rows: [] as QueryResultRow[] }),
+    loadWordComments(wordId, viewerId, 1, 20),
+  ]);
+  return {
+    wordId,
+    likesCount: likes,
+    likedByMe: Boolean(mine.rows[0]),
+    savedByMe: Boolean(saved.rows[0]),
+    commentsCount: comments.total,
+    comments: comments.items,
+  };
+});
+
+app.get('/v3/words/:id/comments', async (request, reply) => {
+  const wordId = asString((request.params as Json).id);
+  const word = await publishedWordOr404(reply, wordId);
+  if (!word) return;
+  const viewer = await optionalAppUser(request);
+  const query = request.query as Json;
+  const current = page(query.page);
+  const size = pageSize(query.pageSize);
+  const { items, total } = await loadWordComments(wordId, viewer ? String(viewer.id) : null, current, size);
+  return { items, meta: { page: current, pageSize: size, total, totalPages: Math.ceil(total / size) } };
+});
+
+app.post('/v3/words/:id/comments', async (request, reply) => {
+  const user = await requireAppUser(request, reply);
+  if (!user) return;
+  if (!(await enforceRateLimit(request, reply, 'app-comment', 30, 15 * 60))) return;
+  const wordId = asString((request.params as Json).id);
+  const word = await publishedWordOr404(reply, wordId);
+  if (!word) return;
+
+  const body = asObject(request.body);
+  const text = asString(body.body);
+  if (!text || text.length > 800) {
+    return apiError(reply, 422, 'validation_failed', 'Izoh 1–800 belgidan iborat bo‘lishi kerak.', { body: ['Izoh matni noto‘g‘ri.'] });
+  }
+  const parentId = nullableString(body.parentCommentId);
+  let parent: QueryResultRow | null = null;
+  if (parentId) {
+    if (!isUuid(parentId)) return apiError(reply, 422, 'validation_failed', 'Javob berilayotgan izoh noto‘g‘ri.');
+    const found = await db.query(
+      `SELECT c.id, c.author_user_id, c.parent_comment_id FROM word_comments c WHERE c.id=$1 AND c.word_id=$2 AND ${VISIBLE_COMMENT_SQL}`,
+      [parentId, wordId],
+    );
+    parent = found.rows[0] ?? null;
+    if (!parent) return apiError(reply, 404, 'not_found', 'Javob berilayotgan izoh topilmadi.');
+    // Javobga javob yozilmaydi: ikki darajali zanjir telefon ekranida
+    // o'qib bo'lmas holga keladi va ilova uni chizmaydi ham.
+    if (parent.parent_comment_id) {
+      return apiError(reply, 422, 'validation_failed', 'Javobga javob yozib bo‘lmaydi. Asosiy izohga javob bering.');
+    }
+  }
+
+  const client: PoolClient = await db.connect();
+  try {
+    await client.query('BEGIN');
+    // Izoh darhol ko'rinadi. Oldindan moderatsiya qilinsa jonli suhbat
+    // bo'lmasdi; nazorat hisobni bloklash va izohni o'chirish orqali.
+    const created = await client.query(
+      `INSERT INTO word_comments (word_id, author_user_id, body, status, parent_comment_id)
+       VALUES ($1,$2::uuid,$3,'approved',$4::uuid) RETURNING id`,
+      [wordId, user.id, text, parentId],
+    );
+    const commentId = String(created.rows[0].id);
+    const actorName = String(user.display_name ?? user.full_name ?? '');
+    const drafts: NotificationDraft[] = [];
+    // Javob bo'lsa — izoh egasiga, aks holda so'z muallifiga. Ikkalasi ham
+    // bir odam bo'lsa `usefulDrafts` takrorni tashlab yuboradi.
+    if (parent?.author_user_id) {
+      drafts.push({
+        recipientUserId: String(parent.author_user_id),
+        actorUserId: String(user.id),
+        entityType: 'word_comment',
+        entityId: commentId,
+        data: { wordId, word: String(word.word), commentId },
+        ...replyNotification(actorName, String(word.word), text),
+      });
+    } else if (word.owner_id) {
+      drafts.push({
+        recipientUserId: String(word.owner_id),
+        actorUserId: String(user.id),
+        entityType: 'word_comment',
+        entityId: commentId,
+        data: { wordId, word: String(word.word), commentId },
+        ...commentNotification(actorName, String(word.word), text),
+      });
+    }
+    await deliverNotifications(client, drafts);
+    await client.query('COMMIT');
+
+    const stored = await db.query(`${COMMENT_SELECT} WHERE c.id=$1`, [commentId]);
+    const total = await db.query<{ total: number }>(
+      `SELECT count(*)::int AS total FROM word_comments c WHERE c.word_id=$1 AND c.parent_comment_id IS NULL AND ${VISIBLE_COMMENT_SQL}`,
+      [wordId],
+    );
+    return reply.status(201).send({
+      comment: mapComment(stored.rows[0], String(user.id)),
+      commentsCount: Number(total.rows[0]?.total ?? 0),
+    });
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    return failFromError(reply, error, 'comment.create');
+  } finally {
+    client.release();
+  }
+});
+
+app.delete('/v3/comments/:id', async (request, reply) => {
+  const user = await requireAppUser(request, reply);
+  if (!user) return;
+  const commentId = asString((request.params as Json).id);
+  if (!isUuid(commentId)) return apiError(reply, 404, 'not_found', 'Izoh topilmadi.');
+  // Egalik serverda tekshiriladi: ilovada tugmani yashirish himoya emas.
+  const found = await db.query(
+    `SELECT id, word_id, author_user_id FROM word_comments WHERE id=$1 AND deleted_at IS NULL`,
+    [commentId],
+  );
+  const comment = found.rows[0];
+  if (!comment) return apiError(reply, 404, 'not_found', 'Izoh topilmadi.');
+  if (String(comment.author_user_id ?? '') !== String(user.id)) {
+    return apiError(reply, 403, 'forbidden', 'Faqat o‘z izohingizni o‘chira olasiz.');
+  }
+  // Jismonan o'chirilmaydi: javoblar zanjiri uzilmasligi va moderator nima
+  // bo'lganini ko'ra olishi uchun.
+  await db.query('UPDATE word_comments SET deleted_at=now(), deleted_by_user_id=$2::uuid WHERE id=$1', [commentId, user.id]);
+  const total = await db.query<{ total: number }>(
+    `SELECT count(*)::int AS total FROM word_comments c WHERE c.word_id=$1 AND c.parent_comment_id IS NULL AND ${VISIBLE_COMMENT_SQL}`,
+    [comment.word_id],
+  );
+  return { id: commentId, commentsCount: Number(total.rows[0]?.total ?? 0) };
+});
+
+app.post('/v3/words/:id/like', async (request, reply) => {
+  const user = await requireAppUser(request, reply);
+  if (!user) return;
+  const wordId = asString((request.params as Json).id);
+  const word = await publishedWordOr404(reply, wordId);
+  if (!word) return;
+
+  const client: PoolClient = await db.connect();
+  try {
+    await client.query('BEGIN');
+    // Takroriy yoqtirish bazada to'siladi: `(word_id, user_id)` qisman
+    // unikal indeksi bor, shuning uchun tez ikki bosish ham bitta yozuv
+    // qoldiradi va hisob buzilmaydi.
+    const inserted = await client.query(
+      'INSERT INTO word_likes (word_id, user_id) VALUES ($1,$2::uuid) ON CONFLICT DO NOTHING RETURNING id',
+      [wordId, user.id],
+    );
+    if (inserted.rowCount && word.owner_id) {
+      await deliverNotifications(client, [{
+        recipientUserId: String(word.owner_id),
+        actorUserId: String(user.id),
+        entityType: 'word',
+        entityId: wordId,
+        data: { wordId, word: String(word.word) },
+        ...likeNotification(String(user.display_name ?? user.full_name ?? ''), String(word.word)),
+      }]);
+    }
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    return failFromError(reply, error, 'word.like');
+  } finally {
+    client.release();
+  }
+  return { wordId, liked: true, likesCount: await likesCountFor(wordId) };
+});
+
+app.delete('/v3/words/:id/like', async (request, reply) => {
+  const user = await requireAppUser(request, reply);
+  if (!user) return;
+  const wordId = asString((request.params as Json).id);
+  if (!isUuid(wordId)) return apiError(reply, 404, 'not_found', 'So‘z topilmadi.');
+  await db.query('DELETE FROM word_likes WHERE word_id=$1 AND user_id=$2::uuid', [wordId, user.id]);
+  return { wordId, liked: false, likesCount: await likesCountFor(wordId) };
+});
+
+app.post('/v3/words/:id/save', async (request, reply) => {
+  const user = await requireAppUser(request, reply);
+  if (!user) return;
+  const wordId = asString((request.params as Json).id);
+  const word = await publishedWordOr404(reply, wordId);
+  if (!word) return;
+  // Birlamchi kalit takroriy saqlashni to'sadi — ikki marta bosilsa
+  // ikkinchi yozuv paydo bo'lmaydi va xato ham qaytmaydi.
+  await db.query(
+    'INSERT INTO word_saves (user_id, word_id) VALUES ($1::uuid,$2) ON CONFLICT DO NOTHING',
+    [user.id, wordId],
+  );
+  return { wordId, saved: true };
+});
+
+app.delete('/v3/words/:id/save', async (request, reply) => {
+  const user = await requireAppUser(request, reply);
+  if (!user) return;
+  const wordId = asString((request.params as Json).id);
+  if (!isUuid(wordId)) return apiError(reply, 404, 'not_found', 'So‘z topilmadi.');
+  await db.query('DELETE FROM word_saves WHERE user_id=$1::uuid AND word_id=$2', [user.id, wordId]);
+  return { wordId, saved: false };
+});
+
+app.get('/v3/app/saved-words', async (request, reply) => {
+  const user = await requireAppUser(request, reply);
+  if (!user) return;
+  const query = request.query as Json;
+  const current = page(query.page);
+  const size = pageSize(query.pageSize);
+  const counted = await db.query<{ total: number }>(
+    `SELECT count(*)::int AS total FROM word_saves s JOIN words w ON w.id = s.word_id
+      WHERE s.user_id=$1::uuid AND w.status='published'`,
+    [user.id],
+  );
+  const rows = await db.query(
+    `SELECT w.*, ${WORD_HAS_AUDIO_SQL} AS has_audio
+       FROM word_saves s JOIN words w ON w.id = s.word_id
+      WHERE s.user_id=$1::uuid AND w.status='published'
+      ORDER BY s.created_at DESC LIMIT $2 OFFSET $3`,
+    [user.id, size, (current - 1) * size],
+  );
+  const total = Number(counted.rows[0]?.total ?? 0);
+  return { items: rows.rows.map(mapWord), meta: { page: current, pageSize: size, total, totalPages: Math.ceil(total / size) } };
+});
+
+/**
+ * Foydalanuvchining o'z takliflari.
+ *
+ * Profildagi «Mening takliflarim» ilgari hech qayerga olib bormasdi:
+ * foydalanuvchi so'z yuborgach uning taqdirini ko'ra olmasdi.
+ */
+app.get('/v3/app/contributions', async (request, reply) => {
+  const user = await requireAppUser(request, reply);
+  if (!user) return;
+  const query = request.query as Json;
+  const current = page(query.page);
+  const size = pageSize(query.pageSize);
+  const params: unknown[] = [user.id];
+  let statusClause = '';
+  const status = asString(query.status);
+  if (status) {
+    if (!['pending', 'approved', 'rejected', 'needs_clarification'].includes(status)) {
+      return apiError(reply, 422, 'validation_failed', 'Holat noto‘g‘ri.');
+    }
+    params.push(status);
+    statusClause = ` AND cr.status = $${params.length}::moderation_status`;
+  }
+  const counted = await db.query<{ total: number }>(
+    `SELECT count(*)::int AS total FROM contribution_requests cr WHERE cr.submitted_by_user_id=$1::uuid${statusClause}`,
+    params,
+  );
+  params.push(size, (current - 1) * size);
+  const rows = await db.query(
+    `SELECT cr.id, cr.payload, cr.status::text AS status, cr.clarification_note, cr.resolved_at,
+            cr.result_word_id, cr.created_at, cr.updated_at,
+            mu.id AS moderator_id, mu.full_name AS moderator_full_name,
+            COALESCE((SELECT array_agg(role.code) FROM user_roles link JOIN roles role ON role.id = link.role_id WHERE link.user_id = mu.id), '{}') AS moderator_roles,
+            a.moderation_status::text AS audio_status
+       FROM contribution_requests cr
+       LEFT JOIN users mu ON mu.id = cr.resolved_by_user_id
+       LEFT JOIN LATERAL (
+         SELECT candidate.moderation_status FROM audio_submissions candidate
+          WHERE candidate.contribution_request_id = cr.id AND candidate.superseded_at IS NULL
+          ORDER BY candidate.created_at DESC LIMIT 1
+       ) a ON true
+      WHERE cr.submitted_by_user_id=$1::uuid${statusClause}
+      ORDER BY cr.created_at DESC LIMIT $${params.length - 1} OFFSET $${params.length}`,
+    params,
+  );
+  const total = Number(counted.rows[0]?.total ?? 0);
+  return {
+    items: rows.rows.map((row) => {
+      const payload = asObject(row.payload);
+      return {
+        id: String(row.id),
+        word: asString(payload.word),
+        meaning: asString(payload.meaning),
+        status: row.status,
+        moderationNote: row.clarification_note ?? null,
+        resolvedBy: mapModeratorProfile(row),
+        resolvedAt: iso(row.resolved_at),
+        resultWordId: row.result_word_id ?? null,
+        hasAudio: Boolean(row.audio_status),
+        audioStatus: row.audio_status ?? null,
+        createdAt: requiredIso(row.created_at),
+        updatedAt: requiredIso(row.updated_at),
+      };
+    }),
+    meta: { page: current, pageSize: size, total, totalPages: Math.ceil(total / size) },
+  };
+});
+
+// ===========================================================================
+// Bildirishnomalar
+// ===========================================================================
+// Ilova va admin uchun bir xil shakl, lekin alohida yo'llar: tokenlar ham
+// har xil auditoriyaga tegishli, shuning uchun bitta yo'lda ikkalasini
+// qabul qilish rollarni aralashtirib yuborardi.
+
+async function notificationPage(reply: FastifyReply, userId: string, query: Json) {
+  const current = page(query.page);
+  const size = pageSize(query.pageSize);
+  const unreadOnly = bool(query.unreadOnly);
+  const filter = unreadOnly ? 'AND n.read_at IS NULL' : '';
+  const counted = await db.query<{ total: number }>(
+    `SELECT count(*)::int AS total FROM notifications n WHERE n.recipient_user_id=$1::uuid ${filter}`,
+    [userId],
+  );
+  const rows = await db.query(
+    `${NOTIFICATION_SELECT} WHERE n.recipient_user_id=$1::uuid ${filter} ORDER BY n.created_at DESC LIMIT $2 OFFSET $3`,
+    [userId, size, (current - 1) * size],
+  );
+  const total = Number(counted.rows[0]?.total ?? 0);
+  return reply.send({
+    items: rows.rows.map(mapNotification),
+    meta: { page: current, pageSize: size, total, totalPages: Math.ceil(total / size) },
+    unreadCount: await unreadNotificationCount(db, userId),
+  });
+}
+
+async function markNotificationRead(reply: FastifyReply, userId: string, notificationId: string) {
+  if (!isUuid(notificationId)) return apiError(reply, 404, 'not_found', 'Bildirishnoma topilmadi.');
+  // `read_at IS NULL` sharti: takroran o'qilgan deb belgilash vaqtni
+  // o'zgartirmaydi va javob har doim bir xil bo'ladi.
+  const updated = await db.query(
+    `UPDATE notifications SET read_at = COALESCE(read_at, now())
+      WHERE id=$1 AND recipient_user_id=$2::uuid RETURNING id`,
+    [notificationId, userId],
+  );
+  if (!updated.rows[0]) return apiError(reply, 404, 'not_found', 'Bildirishnoma topilmadi.');
+  const row = await db.query(`${NOTIFICATION_SELECT} WHERE n.id=$1`, [notificationId]);
+  return reply.send({
+    notification: mapNotification(row.rows[0]),
+    unreadCount: await unreadNotificationCount(db, userId),
+  });
+}
+
+async function markAllNotificationsRead(reply: FastifyReply, userId: string) {
+  const updated = await db.query(
+    'UPDATE notifications SET read_at = now() WHERE recipient_user_id=$1::uuid AND read_at IS NULL',
+    [userId],
+  );
+  return reply.send({ updated: updated.rowCount ?? 0, unreadCount: 0 });
+}
+
+app.get('/v3/app/notifications', async (request, reply) => {
+  const user = await requireAppUser(request, reply);
+  if (!user) return;
+  return notificationPage(reply, String(user.id), request.query as Json);
+});
+
+app.get('/v3/app/notifications/unread-count', async (request, reply) => {
+  const user = await requireAppUser(request, reply);
+  if (!user) return;
+  return { unreadCount: await unreadNotificationCount(db, String(user.id)) };
+});
+
+app.post('/v3/app/notifications/:id/read', async (request, reply) => {
+  const user = await requireAppUser(request, reply);
+  if (!user) return;
+  return markNotificationRead(reply, String(user.id), asString((request.params as Json).id));
+});
+
+app.post('/v3/app/notifications/read-all', async (request, reply) => {
+  const user = await requireAppUser(request, reply);
+  if (!user) return;
+  return markAllNotificationsRead(reply, String(user.id));
+});
+
+app.get('/v3/admin/notifications', async (request, reply) => {
+  const claims = await requirePermission(request, reply, 'requests:read');
+  if (!claims) return;
+  return notificationPage(reply, claims.sub, request.query as Json);
+});
+
+app.get('/v3/admin/notifications/unread-count', async (request, reply) => {
+  const claims = await requirePermission(request, reply, 'requests:read');
+  if (!claims) return;
+  return { unreadCount: await unreadNotificationCount(db, claims.sub) };
+});
+
+app.post('/v3/admin/notifications/:id/read', async (request, reply) => {
+  const claims = await requirePermission(request, reply, 'requests:read');
+  if (!claims) return;
+  return markNotificationRead(reply, claims.sub, asString((request.params as Json).id));
+});
+
+app.post('/v3/admin/notifications/read-all', async (request, reply) => {
+  const claims = await requirePermission(request, reply, 'requests:read');
+  if (!claims) return;
+  return markAllNotificationsRead(reply, claims.sub);
+});
+
 // --- Admin: foydalanuvchilarni kuzatish va bloklash ------------------------
 
 app.get('/v3/admin/app-users', async (request, reply) => {
@@ -960,6 +1668,19 @@ app.patch('/v3/admin/app-users/:id/block', async (request, reply) => {
   );
   if (!updated.rows[0]) return apiError(reply, 404, 'not_found', 'Foydalanuvchi topilmadi.');
   const auditLogId = await audit(claims, blocked ? 'app_user.block' : 'app_user.unblock', 'user', id, reason, { blocked }, request);
+  // Blokdan chiqarilgan odam buni bilishi kerak, aks holda u ilovaga
+  // qaytmaydi. Bloklanganda esa xabar inboxda kutib turadi: bloklangan
+  // hisob so'rov yubora olmaydi, lekin blok olingach uni o'qiydi.
+  await deliverNotifications(db, [{
+    recipientUserId: id,
+    actorUserId: claims.sub,
+    type: blocked ? 'ACCOUNT_BLOCKED' : 'ACCOUNT_UNBLOCKED',
+    title: blocked ? 'Hisobingiz bloklandi' : 'Hisobingiz tiklandi',
+    body: blocked ? `Sabab: ${reason}` : 'Ilovadan yana to‘liq foydalanishingiz mumkin.',
+    entityType: 'user',
+    entityId: id,
+    data: { blocked },
+  }]).catch((error: unknown) => app.log.warn({ err: error, id }, 'Bloklash bildirishnomasi yozilmadi'));
   return { user: mapAppUser(updated.rows[0]), auditLogId };
 });
 
@@ -1017,18 +1738,37 @@ app.patch('/v3/admin/regions/:id', async (request, reply) => {
 
 app.get('/v3/words', async (request) => {
   const query = request.query as Json; const requester = await claimsFor(request); const params: unknown[] = []; const where: string[] = [];
-  if (!requester || !query.status) where.push(`status = 'published'`); else { params.push(query.status); where.push(`status = $${params.length}`); }
-  if (query.search) { params.push(`%${asString(query.search)}%`); where.push(`(word ILIKE $${params.length} OR meaning ILIKE $${params.length})`); }
-  if (query.regionId) { params.push(query.regionId); where.push(`(region_id=$${params.length} OR district_id=$${params.length})`); }
-  if (query.dialectId) { params.push(query.dialectId); where.push(`dialect_id=$${params.length}`); }
-  if (query.category) { params.push(query.category); where.push(`category=$${params.length}`); }
-  const current = page(query.page); const size = pageSize(query.pageSize); const order = query.sort === 'alphabetical' ? 'word ASC' : 'created_at DESC';
-  const count = await db.query(`SELECT count(*)::int AS total FROM words ${where.length ? `WHERE ${where.join(' AND ')}` : ''}`, params);
+  if (!requester || !query.status) where.push(`w.status = 'published'`); else { params.push(query.status); where.push(`w.status = $${params.length}`); }
+  if (query.search) { params.push(`%${asString(query.search)}%`); where.push(`(w.word ILIKE $${params.length} OR w.meaning ILIKE $${params.length})`); }
+  if (query.regionId) { params.push(query.regionId); where.push(`(w.region_id=$${params.length} OR w.district_id=$${params.length})`); }
+  if (query.dialectId) { params.push(query.dialectId); where.push(`w.dialect_id=$${params.length}`); }
+  if (query.category) { params.push(query.category); where.push(`w.category=$${params.length}`); }
+  const current = page(query.page); const size = pageSize(query.pageSize); const order = query.sort === 'alphabetical' ? 'w.word ASC' : 'w.created_at DESC';
+  const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  const count = await db.query(`SELECT count(*)::int AS total FROM words w ${clause}`, params);
   params.push(size, (current - 1) * size);
-  const words = await db.query(`SELECT * FROM words ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY ${order} LIMIT $${params.length - 1} OFFSET $${params.length}`, params);
+  // Ro'yxatda audio havolasi yaratilmaydi — faqat borligi. Har bir yozuv
+  // uchun imzolangan havola olish yuz elementli sahifada yuzta imzolash
+  // (bulut storage'da esa yuzta tarmoq so'rovi) degani bo'lardi.
+  const words = await db.query(
+    `SELECT w.*, ${WORD_HAS_AUDIO_SQL} AS has_audio FROM words w ${clause} ORDER BY ${order} LIMIT $${params.length - 1} OFFSET $${params.length}`,
+    params,
+  );
   const total = count.rows[0].total; return { items: words.rows.map(mapWord), meta: { page: current, pageSize: size, total, totalPages: Math.ceil(total / size) } };
 });
-app.get('/v3/words/:id', async (request, reply) => { const result = await db.query('SELECT * FROM words WHERE id=$1 AND status=\'published\'', [(request.params as Json).id]); if (!result.rows[0]) return apiError(reply, 404, 'not_found', 'So‘z topilmadi.'); return mapWord(result.rows[0]); });
+
+app.get('/v3/words/:id', async (request, reply) => {
+  const id = asString((request.params as Json).id);
+  if (!isUuid(id)) return apiError(reply, 404, 'not_found', 'So‘z topilmadi.');
+  const result = await db.query(
+    `SELECT w.*, ${WORD_HAS_AUDIO_SQL} AS has_audio FROM words w WHERE w.id=$1 AND w.status='published'`,
+    [id],
+  );
+  if (!result.rows[0]) return apiError(reply, 404, 'not_found', 'So‘z topilmadi.');
+  // Bitta so'z so'ralganda esa imzolangan havola beriladi: ilova aynan shu
+  // yerda pleyerni chizadi.
+  return { ...mapWord(result.rows[0]), primaryAudio: await primaryAudioFor(id) };
+});
 
 /** Adminning bevosita lug‘atga kiritishi: foydalanuvchi taklifidan farqli
  * ravishda nashr etilgan yozuv darhol yaratiladi va auditga tushadi. */
@@ -1049,6 +1789,9 @@ app.post('/v3/contributions/words', async (request, reply) => {
   const body = asObject(request.body); const payload = asObject(body.payload); const location = asObject(body.location); const device = asObject(body.device); const key = asString(body.idempotencyKey);
   if (!asString(payload.word) || !asString(payload.meaning) || !key) return apiError(reply, 422, 'validation_failed', 'So‘z, ma’no va idempotency kaliti majburiy.');
   const existing = await db.query(`${requestSql} WHERE cr.idempotency_key=$1`, [key]); if (existing.rows[0]) return { request: await mapRequest(existing.rows[0]), userMessage: 'Avvalgi so‘rov qaytarildi.' };
+  // Hisob majburiy emas, lekin bo'lsa taklif unga bog'lanadi: moderator kim
+  // yuborganini ko'radi va qaror chiqqach foydalanuvchi xabar oladi.
+  const submitter = await optionalAppUser(request);
   const geofences = await activeFences(); const heritageDeclaration = bool(body.heritageDeclaration);
   const hasLocation = Number.isFinite(Number(location.latitude)) && Number.isFinite(Number(location.longitude));
   const gate = hasLocation ? practicalMobileGate(location, geofences) : null;
@@ -1166,10 +1909,18 @@ app.post('/v3/contributions/words', async (request, reply) => {
   const duplicates = await db.query('SELECT id, word, phonetic_key FROM words WHERE status <> \'archived\'');
   const validation = validateContributionText({ payload: payload as never, locationGate: null, duplicateCandidates: duplicates.rows.map((row) => ({ id: row.id, word: row.word, phoneticKey: row.phonetic_key })), origin: 'server', thresholds: { rejectBelow:0, autoQueueAbove:65, minConfidenceForVerdict:0.5 } });
   if (validation.verdict === 'rejected') return apiError(reply, 422, 'validation_failed', 'So‘z avtomatik tekshiruvdan o‘tmadi.');
-  const created = await db.query(`INSERT INTO contribution_requests (payload, device, idempotency_key, latitude, longitude, location_accuracy_m, location_checked_at, submission_location_status, matched_geofence_id, geofence_version, distance_to_boundary_m, is_location_mocked, validation_verdict, validation_score, requires_human_review)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id`, [payload, { ...device, heritageDeclaration }, key, hasLocation ? location.latitude : null, hasLocation ? location.longitude : null, hasLocation ? location.accuracy : null, hasLocation ? location.capturedAt : null, hasLocation ? gate?.status ?? 'not_provided' : 'not_provided', gate?.matchedGeofenceId ?? null, geofences.find((f) => f.id === gate?.matchedGeofenceId)?.version ?? null, gate?.distanceToBoundaryM ?? null, hasLocation ? location.isMocked ?? null : null, validation.verdict, validation.score, true]);
+  const submitterName = submitter ? String(submitter.display_name ?? submitter.full_name ?? '') : null;
+  const created = await db.query(`INSERT INTO contribution_requests (payload, device, idempotency_key, latitude, longitude, location_accuracy_m, location_checked_at, submission_location_status, matched_geofence_id, geofence_version, distance_to_boundary_m, is_location_mocked, validation_verdict, validation_score, requires_human_review, submitted_by_user_id, submitted_by_display_name)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::uuid,$17) RETURNING id`, [payload, { ...device, heritageDeclaration }, key, hasLocation ? location.latitude : null, hasLocation ? location.longitude : null, hasLocation ? location.accuracy : null, hasLocation ? location.capturedAt : null, hasLocation ? gate?.status ?? 'not_provided' : 'not_provided', gate?.matchedGeofenceId ?? null, geofences.find((f) => f.id === gate?.matchedGeofenceId)?.version ?? null, gate?.distanceToBoundaryM ?? null, hasLocation ? location.isMocked ?? null : null, validation.verdict, validation.score, true, submitter?.id ?? null, submitterName]);
   const requestId = created.rows[0].id;
   await db.query(INSERT_VALIDATION_RESULT, [requestId, validation.subject, validation.verdict, validation.score, validation.confidence, jsonb(validation.reasons), validation.engine.kind, validation.engine.name, validation.engine.version, validation.origin, geofences.find((f) => f.id === gate?.matchedGeofenceId)?.version ?? null]);
+  await notifyModerators(
+    submissionNotification('new', asString(payload.word), submitterName),
+    'contribution_request',
+    String(requestId),
+    { word: asString(payload.word), meaning: asString(payload.meaning) },
+    submitter?.id ? String(submitter.id) : null,
+  );
   const record = await db.query(`${requestSql} WHERE cr.id=$1`, [requestId]); return {
     request: await mapRequest(record.rows[0]),
     userMessage: proposedRegion
@@ -1325,6 +2076,25 @@ app.post('/v3/contributions/audio', async (request, reply) => {
     await client.query('COMMIT');
     transactionOpen = false;
     stored = null;
+    // Xabar commitdan keyin: audio allaqachon saqlangan va bildirishnoma
+    // xatosi uni yo'qotishi mumkin emas.
+    const audioOwner = await db.query<{ owner_id: string | null; display_name: string | null }>(
+      `SELECT COALESCE(cr.submitted_by_user_id, w.created_by)::text AS owner_id,
+              COALESCE(owner.display_name, owner.full_name) AS display_name
+         FROM audio_submissions a
+         LEFT JOIN contribution_requests cr ON cr.id = a.contribution_request_id
+         LEFT JOIN words w ON w.id = a.word_id
+         LEFT JOIN users owner ON owner.id = COALESCE(cr.submitted_by_user_id, w.created_by)
+        WHERE a.id = $1`,
+      [created.rows[0].id],
+    );
+    await notifyModerators(
+      audioSubmissionNotification(expectedText, audioOwner.rows[0]?.display_name ?? null),
+      'audio_submission',
+      String(created.rows[0].id),
+      { word: expectedText, contributionRequestId, wordId },
+      nullableString(audioOwner.rows[0]?.owner_id),
+    );
     return reply.status(201).send({ submission: await mapAudioSubmission(created.rows[0]), userMessage: 'Audio moderator tekshiruviga yuborildi.' });
   } catch (error) {
     if (transactionOpen) await client.query('ROLLBACK').catch(() => undefined);
@@ -1448,6 +2218,29 @@ app.patch('/v3/audio/:id/moderation', async (request, reply) => {
       contributionRequestId: previous.contribution_request_id ?? null,
       wordId: previous.word_id ?? null,
     }, request, client);
+
+    // Yozuv egasi ikki yo'l bilan topiladi: taklifga biriktirilgan audio
+    // uchun — taklifni yuborgan hisob, lug'at so'ziga qo'shilgani uchun —
+    // so'z muallifi. Bog'lanmagan yozuvda egasi yo'q va xabar ham yo'q.
+    const owner = await client.query<{ owner_id: string | null }>(
+      `SELECT COALESCE(cr.submitted_by_user_id, w.created_by)::text AS owner_id
+         FROM audio_submissions a
+         LEFT JOIN contribution_requests cr ON cr.id = a.contribution_request_id
+         LEFT JOIN words w ON w.id = a.word_id
+        WHERE a.id = $1`,
+      [audioId],
+    );
+    const ownerId = nullableString(owner.rows[0]?.owner_id);
+    if (ownerId) {
+      await deliverNotifications(client, [{
+        recipientUserId: ownerId,
+        actorUserId: claims.sub,
+        entityType: 'audio_submission',
+        entityId: audioId,
+        data: { word: String(previous.expected_text ?? ''), wordId: previous.word_id ?? null, contributionRequestId: previous.contribution_request_id ?? null },
+        ...audioDecisionNotification(decision.decision as 'approved' | 'rejected' | 'needs_clarification', String(previous.expected_text ?? ''), decision.reason),
+      }]);
+    }
     await client.query('COMMIT');
 
     const context = await db.query(`SELECT a.*,
@@ -1505,7 +2298,10 @@ app.patch('/v3/requests/:id/status', async (request, reply) => {
         if (published[field]) storedPayload[field] = published[field];
         else delete storedPayload[field];
       }
-      const createdWord = await client.query(`INSERT INTO words (word, literary_form, meaning, example, category, phonetic_key, status, region_id, district_id, village_id, dialect_id, clan, dialect_score, source_request_id) VALUES ($1,$2,$3,$4,$5,$6,'published',$7,$8,$9,$10,$11,$12,$13) RETURNING id`, [published.word, published.literaryForm ?? null, published.meaning, published.example ?? null, published.category ?? null, phoneticKey(String(published.word)), published.regionId ?? null, published.districtId ?? null, published.villageId ?? null, published.dialectId ?? null, published.clan ?? null, previous.validation_score, id]);
+      // `created_by` — hissa qo'shgan hisob, moderator emas. Bu munosabat
+      // keyin kerak bo'ladi: so'zga izoh yozilganda yoki u yoqtirilganda
+      // xabar aynan muallifga boradi.
+      const createdWord = await client.query(`INSERT INTO words (word, literary_form, meaning, example, category, phonetic_key, status, region_id, district_id, village_id, dialect_id, clan, dialect_score, source_request_id, created_by, updated_by) VALUES ($1,$2,$3,$4,$5,$6,'published',$7,$8,$9,$10,$11,$12,$13,$14::uuid,$15::uuid) RETURNING id`, [published.word, published.literaryForm ?? null, published.meaning, published.example ?? null, published.category ?? null, phoneticKey(String(published.word)), published.regionId ?? null, published.districtId ?? null, published.villageId ?? null, published.dialectId ?? null, published.clan ?? null, previous.validation_score, id, previous.submitted_by_user_id ?? null, claims.sub]);
       wordId = createdWord.rows[0].id;
     }
     // Parametr turlari nozik — izohi `sql.ts` da.
@@ -1524,6 +2320,23 @@ app.patch('/v3/requests/:id/status', async (request, reply) => {
     }
     await client.query('INSERT INTO moderation_decisions (contribution_request_id, moderator_id, decision, reason, automated_verdict, automated_score) VALUES ($1,$2,$3,$4,$5,$6)', [id,claims.sub,status,reason || null,previous.validation_verdict,previous.validation_score]);
     const auditLogId = await audit(claims, 'request.status_change', 'contribution_request', id, reason || null, { status, wordId, regionResolution, dialectResolution }, request, client);
+
+    // Xabar aynan shu tranzaksiyada yoziladi. Qaror foydalanuvchiga faqat
+    // shu yo'l bilan yetadi: u moderator ekranini ko'rmaydi. Xabar
+    // yozilmasa qaror ham qabul qilinmasligi kerak, aks holda taklif jimgina
+    // hal bo'lib, egasi buni hech qachon bilmay qolardi.
+    const submitterId = nullableString(previous.submitted_by_user_id);
+    if (submitterId) {
+      const decided = wordDecisionNotification(status as 'approved' | 'rejected' | 'needs_clarification', asString(sourcePayload.word), reason);
+      await deliverNotifications(client, [{
+        recipientUserId: submitterId,
+        actorUserId: claims.sub,
+        entityType: status === 'approved' && wordId ? 'word' : 'contribution_request',
+        entityId: status === 'approved' && wordId ? wordId : id,
+        data: { word: asString(sourcePayload.word), requestId: id, status, resultWordId: wordId },
+        ...decided,
+      }]);
+    }
     await client.query('COMMIT');
     const updated = await db.query(`${requestSql} WHERE cr.id=$1`, [id]);
     return { request: await mapRequest(updated.rows[0]), createdWordId: wordId, auditLogId };

@@ -32,7 +32,17 @@ export interface Word extends Auditable {
   dialectId?: Uuid | null;
   clan?: string | null;
   variants?: WordVariant[];
+  /**
+   * Tasdiqlangan talaffuz yozuvi.
+   *
+   * Faqat bitta so'z so'ralganda (`GET /words/:id`) to'ldiriladi: imzolangan
+   * havola yaratish har bir yozuv uchun alohida ish talab qiladi va uni
+   * yuzlab elementli ro'yxatda bajarish lug'atni sekinlashtirardi.
+   * Ro'yxatda audio borligini `hasAudio` bildiradi.
+   */
   primaryAudio?: AudioRef | null;
+  /** Ro'yxatda "audio bor" belgisini chizish uchun — arzon, havolasiz. */
+  hasAudio?: boolean;
   /** Oxirgi avtomatik moslik skori (0–100). */
   dialectScore?: number | null;
   /** Shu so'z qaysi taklifdan yaratilgani. */

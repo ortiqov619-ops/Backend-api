@@ -8,6 +8,7 @@
 
 export * from './contract/common';
 export * from './contract/auth';
+export * from './contract/profile';
 export * from './contract/geo';
 export * from './contract/validation';
 export * from './contract/words';
@@ -17,6 +18,7 @@ export * from './contract/contributions';
 export * from './contract/admin';
 export * from './contract/telemetry';
 export * from './contract/community';
+export * from './contract/notifications';
 
 export * from './geo/polygon';
 export * from './geo/gate';
