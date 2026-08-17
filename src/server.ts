@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, stat, unlink, writeFile } from 'node:fs/promises';
 import { basename, join, resolve, sep } from 'node:path';
 import bcrypt from 'bcryptjs';
 import cors from '@fastify/cors';
@@ -240,6 +240,24 @@ async function primaryAudioFor(wordId: string): Promise<{ id: string; playbackUr
   );
   const row = found.rows[0];
   if (!row) return null;
+
+  // Yozuv bazada bor, lekin fayl diskda yo'q bo'lishi mumkin: doimiy disk
+  // ulanishidan oldin yuklangan audiolar konteyner bilan birga o'chib
+  // ketgan. Bunday yozuv uchun havola berish foydalanuvchiga ishlamaydigan
+  // tugma ko'rsatish bilan barobar, shuning uchun avval fayl borligini
+  // tekshiramiz va yo'q bo'lsa "talaffuz yo'q" deymiz.
+  if (row.storage_bucket === 'local') {
+    const uploadRoot = resolve(config.uploadDir);
+    const audioPath = resolve(uploadRoot, String(row.storage_key));
+    if (audioPath !== uploadRoot && !audioPath.startsWith(`${uploadRoot}${sep}`)) return null;
+    try {
+      await stat(audioPath);
+    } catch {
+      app.log.warn({ wordId, audioId: row.id }, 'Tasdiqlangan audio fayli diskda topilmadi');
+      return null;
+    }
+  }
+
   try {
     const playback = await createPlaybackAccess(row);
     return { id: String(row.id), durationMs: Number(row.duration_ms), mimeType: String(row.mime_type), ...playback };
