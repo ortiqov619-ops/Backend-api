@@ -240,9 +240,34 @@ function mapWord(row: QueryResultRow) {
  */
 const WORD_AUDIO_MATCH_SQL = `au.superseded_at IS NULL
   AND au.moderation_status = 'approved'
+  AND au.storage_available
   AND (au.word_id = w.id OR au.contribution_request_id = w.source_request_id)`;
 
 const WORD_HAS_AUDIO_SQL = `EXISTS (SELECT 1 FROM audio_submissions au WHERE ${WORD_AUDIO_MATCH_SQL})`;
+
+/**
+ * Yozuvni "saqlashda yo'q" deb belgilaydi.
+ *
+ * Yozuv o'chirilmaydi: u moderatsiya tarixining bir qismi va moderator
+ * uni "qayta yozish kerak" holatida ko'rishi kerak. Belgilash bir marta
+ * bajariladi — takroriy so'rovlar bazaga yozmaydi.
+ */
+async function markAudioMissing(audioId: string, reason: string): Promise<void> {
+  try {
+    const updated = await db.query(
+      `UPDATE audio_submissions
+          SET storage_available = false, storage_checked_at = now()
+        WHERE id = $1 AND storage_available
+        RETURNING id`,
+      [audioId],
+    );
+    if (updated.rowCount) {
+      app.log.warn({ audioId, reason }, 'Audio saqlashda topilmadi — yozuv «yo‘q» deb belgilandi');
+    }
+  } catch (error: unknown) {
+    app.log.warn({ err: error, audioId }, 'Audio holatini yangilab bo‘lmadi');
+  }
+}
 
 async function primaryAudioFor(wordId: string): Promise<{ id: string; playbackUrl: string; playbackUrlExpiresAt: string; durationMs: number; mimeType: string } | null> {
   const found = await db.query(
@@ -264,11 +289,17 @@ async function primaryAudioFor(wordId: string): Promise<{ id: string; playbackUr
   if (row.storage_bucket === 'local') {
     const uploadRoot = resolve(config.uploadDir);
     const audioPath = resolve(uploadRoot, String(row.storage_key));
-    if (audioPath !== uploadRoot && !audioPath.startsWith(`${uploadRoot}${sep}`)) return null;
+    if (audioPath !== uploadRoot && !audioPath.startsWith(`${uploadRoot}${sep}`)) {
+      await markAudioMissing(String(row.id), 'yo‘l saqlash katalogidan tashqarida');
+      return null;
+    }
     try {
       await stat(audioPath);
     } catch {
-      app.log.warn({ wordId, audioId: row.id }, 'Tasdiqlangan audio fayli diskda topilmadi');
+      // Holat bazaga yoziladi: shundan keyin admin ro'yxati ham, lug'at ham
+      // bir xil haqiqatni ko'rsatadi va "3.8 soniya audio bor" degan
+      // yolg'on takrorlanmaydi.
+      await markAudioMissing(String(row.id), 'fayl diskda topilmadi');
       return null;
     }
   }
@@ -500,6 +531,9 @@ async function mapAudioSubmission(row: QueryResultRow) {
       failureMessage: row.audio_failure_message ?? row.failure_message ?? null,
     },
     moderationStatus: row.audio_moderation_status ?? row.moderation_status,
+    // Fayl saqlashda bormi. `false` bo'lsa ilova pleyer ko'rsatmaydi va
+    // «qayta yozish kerak» holatini chizadi.
+    storageAvailable: row.audio_storage_available ?? row.storage_available ?? true,
     version: Number(row.audio_version ?? row.version ?? 1),
     supersededAt: iso(row.audio_superseded_at ?? row.superseded_at),
     createdAt: requiredIso(createdAt),
@@ -545,7 +579,7 @@ async function mapRequest(row: QueryResultRow) {
   const audio = row.audio_id ? await mapAudioSubmission(row) : null;
   return { id: row.id, type: row.type, status: row.status, payload: row.payload, submittedByUserId: row.submitted_by_user_id, submittedByDisplayName: row.submitted_by_display_name, submitter: mapContributorProfile(row), device: row.device, latitude: row.latitude, longitude: row.longitude, locationAccuracyM: row.location_accuracy_m, locationCheckedAt: iso(row.location_checked_at), submissionLocationStatus: row.submission_location_status, matchedGeofenceId: row.matched_geofence_id, geofenceVersion: row.geofence_version, validationVerdict: row.validation_verdict, validationScore: row.validation_score, validationResults: row.validation_results ?? [], audio, clarificationNote: row.clarification_note, resolvedAt: iso(row.resolved_at), resolvedByUserId: row.resolved_by_user_id, resolvedBy: mapModeratorProfile(row), resultWordId: row.result_word_id, createdAt: iso(row.created_at), updatedAt: iso(row.updated_at) };
 }
-const requestSql = `SELECT cr.*, a.id AS audio_id, a.contribution_request_id AS audio_contribution_request_id, a.word_id AS audio_word_id, a.storage_bucket, a.storage_key, a.mime_type, a.duration_ms, a.size_bytes, a.sample_rate_hz, a.checksum_sha256, a.expected_text, a.analysis_status, a.pipeline_stage, a.transcript, a.transcript_confidence, a.detected_language, a.dialect_confidence, a.pronunciation_similarity, a.text_audio_match, a.overall_score, a.analysis_reasons, a.requires_human_review AS audio_requires_review, a.engine_name AS audio_engine_name, a.engine_version AS audio_engine_version, a.engine_provider AS audio_engine_provider, a.failure_message AS audio_failure_message, a.moderation_status AS audio_moderation_status, a.version AS audio_version, a.superseded_at AS audio_superseded_at, a.analyzed_at, a.created_at AS audio_created_at, a.updated_at AS audio_updated_at,
+const requestSql = `SELECT cr.*, a.id AS audio_id, a.contribution_request_id AS audio_contribution_request_id, a.word_id AS audio_word_id, a.storage_bucket, a.storage_key, a.mime_type, a.duration_ms, a.size_bytes, a.sample_rate_hz, a.checksum_sha256, a.expected_text, a.analysis_status, a.pipeline_stage, a.transcript, a.transcript_confidence, a.detected_language, a.dialect_confidence, a.pronunciation_similarity, a.text_audio_match, a.overall_score, a.analysis_reasons, a.requires_human_review AS audio_requires_review, a.engine_name AS audio_engine_name, a.engine_version AS audio_engine_version, a.engine_provider AS audio_engine_provider, a.failure_message AS audio_failure_message, a.moderation_status AS audio_moderation_status, a.storage_available AS audio_storage_available, a.version AS audio_version, a.superseded_at AS audio_superseded_at, a.analyzed_at, a.created_at AS audio_created_at, a.updated_at AS audio_updated_at,
   COALESCE((SELECT jsonb_agg(jsonb_build_object('subject', vr.subject, 'verdict', vr.verdict, 'score', vr.score, 'confidence', vr.confidence, 'reasons', vr.reasons, 'origin', vr.origin, 'evaluatedAt', vr.evaluated_at)) FROM validation_results vr WHERE vr.contribution_request_id = cr.id), '[]'::jsonb) AS validation_results,
   -- Hissa qo'shuvchi va qaror qabul qilgan moderator id sifatida emas,
   -- profil sifatida qaytadi. Ilgari moderator faqat uuid ko'rar edi va
@@ -1798,9 +1832,16 @@ app.get('/v3/words/:id', async (request, reply) => {
     [id],
   );
   if (!result.rows[0]) return apiError(reply, 404, 'not_found', 'So‘z topilmadi.');
-  // Bitta so'z so'ralganda esa imzolangan havola beriladi: ilova aynan shu
+  // Bitta so'z so'ralganda imzolangan havola beriladi: ilova aynan shu
   // yerda pleyerni chizadi.
-  return { ...mapWord(result.rows[0]), primaryAudio: await primaryAudioFor(id) };
+  //
+  // `hasAudio` shu yerda haqiqiy natijadan olinadi. SQL sharti faqat
+  // bazadagi bayroqqa qaraydi va fayl endigina yo'qolgan bo'lsa u hali
+  // `true` bo'lib turadi — natijada bitta javob ichida «audio bor»
+  // deyilib, havola `null` qaytardi. Aynan shu qarama-qarshilikni
+  // foydalanuvchi ekranda ko'rgan edi.
+  const primaryAudio = await primaryAudioFor(id);
+  return { ...mapWord(result.rows[0]), hasAudio: Boolean(primaryAudio), primaryAudio };
 });
 
 /** Adminning bevosita lug‘atga kiritishi: foydalanuvchi taklifidan farqli
@@ -1822,9 +1863,18 @@ app.post('/v3/contributions/words', async (request, reply) => {
   const body = asObject(request.body); const payload = asObject(body.payload); const location = asObject(body.location); const device = asObject(body.device); const key = asString(body.idempotencyKey);
   if (!asString(payload.word) || !asString(payload.meaning) || !key) return apiError(reply, 422, 'validation_failed', 'So‘z, ma’no va idempotency kaliti majburiy.');
   const existing = await db.query(`${requestSql} WHERE cr.idempotency_key=$1`, [key]); if (existing.rows[0]) return { request: await mapRequest(existing.rows[0]), userMessage: 'Avvalgi so‘rov qaytarildi.' };
-  // Hisob majburiy emas, lekin bo'lsa taklif unga bog'lanadi: moderator kim
-  // yuborganini ko'radi va qaror chiqqach foydalanuvchi xabar oladi.
-  const submitter = await optionalAppUser(request);
+  /**
+   * Hissa qo'shish hisob talab qiladi.
+   *
+   * Ilgari u ixtiyoriy edi va natijada egasiz so'zlar ommaviy lug'atga
+   * tushardi: moderator kim yuborganini bilmasdi, muallifga qaror haqida
+   * xabar bormasdi va so'z hech kimga tegishli bo'lmay qolardi
+   * (`words.created_by = NULL`).
+   *
+   * Lug'atni O'QISH ochiq bo'lib qoladi — faqat yozish hisobga bog'landi.
+   */
+  const submitter = await requireAppUser(request, reply);
+  if (!submitter) return;
   const geofences = await activeFences(); const heritageDeclaration = bool(body.heritageDeclaration);
   const hasLocation = Number.isFinite(Number(location.latitude)) && Number.isFinite(Number(location.longitude));
   const gate = hasLocation ? practicalMobileGate(location, geofences) : null;
@@ -1942,9 +1992,9 @@ app.post('/v3/contributions/words', async (request, reply) => {
   const duplicates = await db.query('SELECT id, word, phonetic_key FROM words WHERE status <> \'archived\'');
   const validation = validateContributionText({ payload: payload as never, locationGate: null, duplicateCandidates: duplicates.rows.map((row) => ({ id: row.id, word: row.word, phoneticKey: row.phonetic_key })), origin: 'server', thresholds: { rejectBelow:0, autoQueueAbove:65, minConfidenceForVerdict:0.5 } });
   if (validation.verdict === 'rejected') return apiError(reply, 422, 'validation_failed', 'So‘z avtomatik tekshiruvdan o‘tmadi.');
-  const submitterName = submitter ? String(submitter.display_name ?? submitter.full_name ?? '') : null;
+  const submitterName = String(submitter.display_name ?? submitter.full_name ?? '');
   const created = await db.query(`INSERT INTO contribution_requests (payload, device, idempotency_key, latitude, longitude, location_accuracy_m, location_checked_at, submission_location_status, matched_geofence_id, geofence_version, distance_to_boundary_m, is_location_mocked, validation_verdict, validation_score, requires_human_review, submitted_by_user_id, submitted_by_display_name)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::uuid,$17) RETURNING id`, [payload, { ...device, heritageDeclaration }, key, hasLocation ? location.latitude : null, hasLocation ? location.longitude : null, hasLocation ? location.accuracy : null, hasLocation ? location.capturedAt : null, hasLocation ? gate?.status ?? 'not_provided' : 'not_provided', gate?.matchedGeofenceId ?? null, geofences.find((f) => f.id === gate?.matchedGeofenceId)?.version ?? null, gate?.distanceToBoundaryM ?? null, hasLocation ? location.isMocked ?? null : null, validation.verdict, validation.score, true, submitter?.id ?? null, submitterName]);
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::uuid,$17) RETURNING id`, [payload, { ...device, heritageDeclaration }, key, hasLocation ? location.latitude : null, hasLocation ? location.longitude : null, hasLocation ? location.accuracy : null, hasLocation ? location.capturedAt : null, hasLocation ? gate?.status ?? 'not_provided' : 'not_provided', gate?.matchedGeofenceId ?? null, geofences.find((f) => f.id === gate?.matchedGeofenceId)?.version ?? null, gate?.distanceToBoundaryM ?? null, hasLocation ? location.isMocked ?? null : null, validation.verdict, validation.score, true, submitter.id, submitterName]);
   const requestId = created.rows[0].id;
   await db.query(INSERT_VALIDATION_RESULT, [requestId, validation.subject, validation.verdict, validation.score, validation.confidence, jsonb(validation.reasons), validation.engine.kind, validation.engine.name, validation.engine.version, validation.origin, geofences.find((f) => f.id === gate?.matchedGeofenceId)?.version ?? null]);
   await notifyModerators(
@@ -1952,7 +2002,7 @@ app.post('/v3/contributions/words', async (request, reply) => {
     'contribution_request',
     String(requestId),
     { word: asString(payload.word), meaning: asString(payload.meaning) },
-    submitter?.id ? String(submitter.id) : null,
+    String(submitter.id),
   );
   const record = await db.query(`${requestSql} WHERE cr.id=$1`, [requestId]); return {
     request: await mapRequest(record.rows[0]),
@@ -2666,7 +2716,10 @@ app.get('/v3/audio/:id', async (request, reply) => {
       .header('Content-Length', String(chunk.length))
       .send(chunk);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return apiError(reply, 404, 'not_found', 'Audio fayl topilmadi.');
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      await markAudioMissing(audioId, 'tinglashda fayl topilmadi');
+      return apiError(reply, 404, 'not_found', 'Audio fayl topilmadi.');
+    }
     throw error;
   }
 });

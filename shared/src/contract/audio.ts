@@ -83,6 +83,15 @@ export interface AudioSubmission extends Auditable {
   expectedText: string;
   analysis: AudioAnalysis;
   moderationStatus: 'pending' | 'approved' | 'rejected' | 'needs_clarification';
+  /**
+   * Audio fayli saqlashda hali mavjudmi.
+   *
+   * `false` — yozuv bazada bor, lekin fayl yo'qolgan (masalan doimiy
+   * disksiz muhitda deploydan keyin). Bunda pleyer ko'rsatilmaydi va
+   * moderator «qayta yozish kerak» holatini ko'radi. Yozuvning o'zi
+   * o'chirilmaydi: u moderatsiya tarixi.
+   */
+  storageAvailable?: boolean;
   /** Qayta yozilgan talaffuz uchun ortadi. Birinchi yozuv — `1`. */
   version?: number;
   /**
