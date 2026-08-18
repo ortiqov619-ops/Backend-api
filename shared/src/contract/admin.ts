@@ -68,6 +68,9 @@ export type AuditAction =
   | 'dialect.update'
   | 'integration.update'
   | 'integration.rotate'
+  | 'release.publish'
+  | 'release.update'
+  | 'release.rollback'
   | 'user.role_change'
   | 'app_user.block'
   | 'app_user.unblock';
@@ -80,7 +83,8 @@ export type AuditEntityType =
   | 'region'
   | 'geofence'
   | 'dialect'
-  | 'integration_secret';
+  | 'integration_secret'
+  | 'app_release';
 
 export interface AuditLogEntry {
   id: Uuid;

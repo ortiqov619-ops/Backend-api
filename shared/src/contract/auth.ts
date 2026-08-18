@@ -26,7 +26,9 @@ export type Permission =
   | 'audit:read'
   | 'integrations:read'
   | 'integrations:write'
-  | 'users:manage';
+  | 'users:manage'
+  | 'releases:read'
+  | 'releases:write';
 
 export const ROLE_PERMISSIONS: Record<AdminRole, readonly Permission[]> = {
   admin: [
@@ -46,6 +48,8 @@ export const ROLE_PERMISSIONS: Record<AdminRole, readonly Permission[]> = {
     'integrations:read',
     'integrations:write',
     'users:manage',
+    'releases:read',
+    'releases:write',
   ],
   moderator: [
     'dashboard:read',
@@ -56,8 +60,9 @@ export const ROLE_PERMISSIONS: Record<AdminRole, readonly Permission[]> = {
     'audio:moderate',
     'regions:read',
     'audit:read',
+    'releases:read',
   ],
-  editor: ['dashboard:read', 'words:read', 'words:write', 'requests:read', 'regions:read'],
+  editor: ['dashboard:read', 'words:read', 'words:write', 'requests:read', 'regions:read', 'releases:read'],
 };
 
 export function permissionsForRoles(roles: readonly AdminRole[]): Permission[] {

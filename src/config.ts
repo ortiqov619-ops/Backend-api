@@ -26,6 +26,23 @@ export const config = {
     ?? process.env.RENDER_EXTERNAL_URL
     ?? `http://127.0.0.1:${process.env.PORT ?? 3000}`
   ).replace(/\/+$/, ''),
+  /** CI reliz nashr qilish uchun mashinaviy token. Bo'sh bo'lsa endpoint yopiq. */
+  releaseToken: process.env.RELEASE_TOKEN,
+  /** FCM service account (xom JSON yoki base64). Bo'sh bo'lsa push o'chirilgan. */
+  firebaseServiceAccount: process.env.FIREBASE_SERVICE_ACCOUNT,
+  /** APK fayllari saqlanadigan katalog. Renderda doimiy diskda bo'lishi shart. */
+  apkDir: process.env.APK_UPLOAD_DIR ?? './var/apk',
+  /** Har bir ilova turi uchun diskda saqlanadigan reliz soni. */
+  apkRetention: Math.max(1, Number(process.env.APK_RETENTION ?? 5)),
+  /**
+   * APK yuklab olish manzilining ochiq bazasi.
+   *
+   * Odatda bu Cloudflare Worker manzili bo'ladi: telefon Render'ga
+   * to'g'ridan-to'g'ri ulanganda O'zbekistondan TCP ~15 soniya oladi,
+   * Cloudflare orqali esa ~0.2 soniya. 35 MB faylni yuklab olishda bu
+   * farq juda katta.
+   */
+  publicDownloadBaseUrl: (process.env.PUBLIC_DOWNLOAD_BASE_URL ?? '').replace(/\/+$/, ''),
   trustProxy: process.env.TRUST_PROXY === 'true'
     || Boolean(process.env.RENDER)
     || Boolean(process.env.RAILWAY_ENVIRONMENT),

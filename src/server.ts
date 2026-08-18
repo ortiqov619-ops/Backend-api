@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { mkdir, readFile, stat, unlink, writeFile } from 'node:fs/promises';
 import { basename, join, resolve, sep } from 'node:path';
 import bcrypt from 'bcryptjs';
@@ -63,8 +63,23 @@ import {
 } from './pattern-auth';
 import { INSERT_VALIDATION_RESULT, jsonb, UPDATE_REQUEST_RESOLUTION } from './sql';
 import { iso, requiredIso } from './timestamps';
+import {
+  APP_TYPES,
+  decideUpdate,
+  parseReleaseInput,
+  PLATFORMS,
+  ReleaseValidationError,
+  updateNotificationText,
+  updateTopic,
+  UPDATE_TYPES,
+} from './app-releases';
+import { parseServiceAccount, sendUpdateToTopic } from './fcm';
 
 assertProductionConfig();
+// Service account bir marta o'qiladi. Sozlanmagan bo'lsa `null` bo'lib
+// qoladi va push jimgina o'tkazib yuboriladi — yangilanish tizimi
+// versiya so'rovi orqali baribir ishlaydi.
+const firebaseAccount = parseServiceAccount(config.firebaseServiceAccount);
 const db = new Pool({ connectionString: config.databaseUrl, ssl: process.env.DATABASE_SSL === 'true' ? { rejectUnauthorized: false } : undefined });
 const app = Fastify({ logger: true, bodyLimit: 10 * 1024 * 1024, trustProxy: config.trustProxy });
 
@@ -2653,6 +2668,479 @@ app.get('/v3/audio/:id', async (request, reply) => {
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return apiError(reply, 404, 'not_found', 'Audio fayl topilmadi.');
     throw error;
+  }
+});
+
+
+// ===========================================================================
+// Ilova relizlari va yangilanish tekshiruvi
+// ===========================================================================
+// Ikki mustaqil yo'l: USER va ADMIN. Har bir so'rovda `appType` majburiy va
+// server hech qachon bir ilovaning relizini ikkinchisiga qaytarmaydi.
+//
+// Push — yordamchi kanal. Asosiy mexanizm shu: ilova har ochilganda va fondan
+// qaytganda shu endpointga murojaat qiladi. Shuning uchun bildirishnoma
+// o'chirilgan, qurilma oflayn bo'lgan yoki xabar yo'qolgan holatlarda ham
+// yangilanish topiladi.
+
+function mapRelease(row: QueryResultRow) {
+  return {
+    id: String(row.id),
+    appType: row.app_type,
+    platform: row.platform,
+    versionName: row.version_name,
+    versionCode: Number(row.version_code),
+    minimumSupportedVersionCode: Number(row.minimum_supported_version_code),
+    updateType: row.update_type,
+    downloadUrl: row.download_url ?? null,
+    fileSize: row.file_size === null || row.file_size === undefined ? null : Number(row.file_size),
+    sha256: row.sha256 ?? null,
+    releaseNotes: (row.release_notes as string[] | null) ?? [],
+    isActive: Boolean(row.is_active),
+    publishedAt: requiredIso(row.published_at),
+    publishedVia: row.published_via ?? 'ci',
+    ...(row.device_count === undefined ? {} : { deviceCount: Number(row.device_count) }),
+    createdAt: requiredIso(row.created_at),
+    updatedAt: requiredIso(row.updated_at),
+  };
+}
+
+function releaseViewFrom(row: QueryResultRow) {
+  return {
+    versionName: String(row.version_name),
+    versionCode: Number(row.version_code),
+    minimumSupportedVersionCode: Number(row.minimum_supported_version_code),
+    updateType: row.update_type as 'OPTIONAL' | 'RECOMMENDED' | 'REQUIRED',
+    downloadUrl: (row.download_url as string | null) ?? null,
+    fileSize: row.file_size === null || row.file_size === undefined ? null : Number(row.file_size),
+    sha256: (row.sha256 as string | null) ?? null,
+    releaseNotes: (row.release_notes as string[] | null) ?? [],
+    publishedAt: requiredIso(row.published_at),
+  };
+}
+
+/** Eng yuqori `version_code` ga ega faol reliz. */
+async function latestActiveRelease(appType: string, platform: string): Promise<QueryResultRow | null> {
+  const found = await db.query(
+    `SELECT * FROM app_releases
+      WHERE app_type=$1::app_type AND platform=$2::app_platform AND is_active
+      ORDER BY version_code DESC LIMIT 1`,
+    [appType, platform],
+  );
+  return found.rows[0] ?? null;
+}
+
+function apkFileName(appType: string, versionCode: number): string {
+  return `${appType.toLowerCase()}-${versionCode}.apk`;
+}
+
+function downloadUrlFor(appType: string, versionCode: number): string {
+  const base = config.publicDownloadBaseUrl || config.publicBaseUrl;
+  return `${base}/v3/app-updates/download/${appType.toLowerCase()}/${versionCode}.apk`;
+}
+
+/**
+ * CI relizni nashr qilish huquqi.
+ *
+ * Bu mashinaviy yo'l: oddiy foydalanuvchi yoki admin sessiyasi emas, alohida
+ * token. Token sozlanmagan bo'lsa endpoint butunlay yopiq bo'ladi — sukut
+ * bo'yicha ochiq qolishi xavfli bo'lardi.
+ */
+function releaseTokenValid(request: FastifyRequest): boolean {
+  const expected = config.releaseToken;
+  if (!expected || expected.length < 24) return false;
+  const provided = request.headers.authorization?.startsWith('Bearer ')
+    ? request.headers.authorization.slice(7)
+    : '';
+  if (!provided) return false;
+  // Uzunliklar teng bo'lmasa `timingSafeEqual` xato tashlaydi.
+  const a = Buffer.from(provided);
+  const b = Buffer.from(expected);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+app.get('/v3/app-updates/check', async (request, reply) => {
+  const query = request.query as Json;
+  const appType = asString(query.appType).toUpperCase();
+  const platform = (asString(query.platform).toUpperCase() || 'ANDROID');
+  if (!APP_TYPES.includes(appType as never)) {
+    return apiError(reply, 422, 'validation_failed', 'appType USER yoki ADMIN bo‘lishi kerak.');
+  }
+  if (!PLATFORMS.includes(platform as never)) {
+    return apiError(reply, 422, 'validation_failed', 'platform ANDROID yoki IOS bo‘lishi kerak.');
+  }
+  const versionCode = Number(query.versionCode);
+  if (!Number.isSafeInteger(versionCode) || versionCode < 0) {
+    return apiError(reply, 422, 'validation_failed', 'versionCode butun son bo‘lishi kerak.');
+  }
+
+  const row = await latestActiveRelease(appType, platform);
+  // Javob qisqa vaqt keshlanadi: ilova har ochilganda so'raydi va bu
+  // Cloudflare tomonida arzon bo'lishi kerak.
+  reply.header('Cache-Control', 'public, max-age=60');
+  return decideUpdate(versionCode, row ? releaseViewFrom(row) : null);
+});
+
+/**
+ * Qurilmani ro'yxatdan o'tkazadi.
+ *
+ * `installationId` — ilovaning o'zi yaratgan tasodifiy qiymat. IMEI yoki
+ * boshqa cheklangan apparat identifikatorlari ishlatilmaydi.
+ *
+ * Javobda yangilanish holati ham qaytadi: ilova ochilganda ikkita alohida
+ * so'rov yuborish o'rniga bittasi yetadi.
+ */
+app.post('/v3/devices/register', async (request, reply) => {
+  if (!(await enforceRateLimit(request, reply, 'device-register', 120, 60 * 60))) return;
+  const body = asObject(request.body);
+  const installationId = asString(body.installationId);
+  const appType = asString(body.appType).toUpperCase();
+  const platform = (asString(body.platform).toUpperCase() || 'ANDROID');
+  const versionCode = Number(body.appVersionCode);
+
+  if (!installationId || installationId.length < 4 || installationId.length > 160) {
+    return apiError(reply, 422, 'validation_failed', 'installationId noto‘g‘ri.');
+  }
+  if (!APP_TYPES.includes(appType as never)) return apiError(reply, 422, 'validation_failed', 'appType noto‘g‘ri.');
+  if (!PLATFORMS.includes(platform as never)) return apiError(reply, 422, 'validation_failed', 'platform noto‘g‘ri.');
+  if (!Number.isSafeInteger(versionCode) || versionCode < 0) {
+    return apiError(reply, 422, 'validation_failed', 'appVersionCode noto‘g‘ri.');
+  }
+
+  // Hisobga kirgan bo'lsa qurilma unga bog'lanadi. Bu majburiy emas:
+  // mehmon foydalanuvchi ham yangilanish oladi.
+  const account = await optionalAppUser(request);
+
+  await db.query(
+    `INSERT INTO app_devices (installation_id, app_type, platform, app_version_name, app_version_code, fcm_token, user_id, device_model, os_version, last_seen_at)
+     VALUES ($1,$2::app_type,$3::app_platform,$4,$5,$6,$7::uuid,$8,$9, now())
+     ON CONFLICT (installation_id, app_type) DO UPDATE SET
+       platform = EXCLUDED.platform,
+       app_version_name = EXCLUDED.app_version_name,
+       app_version_code = EXCLUDED.app_version_code,
+       -- Token faqat yangi qiymat kelganda almashtiriladi: ilova uni
+       -- bilmasdan yuborsa, eskisi o'chib ketmasligi kerak.
+       fcm_token = COALESCE(EXCLUDED.fcm_token, app_devices.fcm_token),
+       user_id = COALESCE(EXCLUDED.user_id, app_devices.user_id),
+       device_model = COALESCE(EXCLUDED.device_model, app_devices.device_model),
+       os_version = COALESCE(EXCLUDED.os_version, app_devices.os_version),
+       last_seen_at = now()`,
+    [
+      installationId, appType, platform,
+      nullableString(body.appVersionName), versionCode,
+      nullableString(body.fcmToken), account?.id ?? null,
+      nullableString(body.deviceModel), nullableString(body.osVersion),
+    ],
+  );
+
+  const row = await latestActiveRelease(appType, platform);
+  return { registered: true, update: decideUpdate(versionCode, row ? releaseViewFrom(row) : null) };
+});
+
+app.post('/v3/devices/refresh-token', async (request, reply) => {
+  if (!(await enforceRateLimit(request, reply, 'device-token', 60, 60 * 60))) return;
+  const body = asObject(request.body);
+  const installationId = asString(body.installationId);
+  const appType = asString(body.appType).toUpperCase();
+  const fcmToken = asString(body.fcmToken);
+  if (!installationId || !APP_TYPES.includes(appType as never) || !fcmToken || fcmToken.length > 4_096) {
+    return apiError(reply, 422, 'validation_failed', 'installationId, appType va fcmToken majburiy.');
+  }
+  const updated = await db.query(
+    `UPDATE app_devices SET fcm_token=$3, last_seen_at=now()
+      WHERE installation_id=$1 AND app_type=$2::app_type RETURNING id`,
+    [installationId, appType, fcmToken],
+  );
+  if (!updated.rows[0]) return apiError(reply, 404, 'not_found', 'Qurilma ro‘yxatdan o‘tmagan.');
+  return { updated: true };
+});
+
+/** Nashr etilgan APK. Ochiq: ilova uni tokensiz yuklab olishi kerak. */
+app.get('/v3/app-updates/download/:appType/:file', async (request, reply) => {
+  const params = request.params as Json;
+  const appType = asString(params.appType).toUpperCase();
+  const file = asString(params.file);
+  const match = /^(\d+)\.apk$/.exec(file);
+  if (!APP_TYPES.includes(appType as never) || !match) {
+    return apiError(reply, 404, 'not_found', 'Reliz topilmadi.');
+  }
+  const versionCode = Number(match[1]);
+  const found = await db.query(
+    `SELECT storage_key, file_size FROM app_releases
+      WHERE app_type=$1::app_type AND platform='ANDROID' AND version_code=$2 AND storage_key IS NOT NULL`,
+    [appType, versionCode],
+  );
+  const row = found.rows[0];
+  if (!row) return apiError(reply, 404, 'not_found', 'Reliz topilmadi.');
+
+  // Kalit bazadan kelsa ham yo'l tekshiriladi: saqlash katalogidan
+  // tashqariga chiqadigan kalit hech qachon o'qilmasligi kerak.
+  const root = resolve(config.apkDir);
+  const apkPath = resolve(root, String(row.storage_key));
+  if (apkPath !== root && !apkPath.startsWith(`${root}${sep}`)) {
+    return apiError(reply, 404, 'not_found', 'Reliz topilmadi.');
+  }
+  try {
+    const apk = await readFile(apkPath);
+    return reply
+      .type('application/vnd.android.package-archive')
+      // Reliz fayli o'zgarmaydi, shuning uchun uzoq keshlanadi.
+      .header('Cache-Control', 'public, max-age=604800, immutable')
+      .header('Content-Length', String(apk.length))
+      .header('Content-Disposition', `attachment; filename="${apkFileName(appType, versionCode)}"`)
+      .send(apk);
+  } catch {
+    app.log.error({ appType, versionCode }, 'Reliz APK fayli diskda topilmadi');
+    return apiError(reply, 404, 'not_found', 'Reliz fayli topilmadi.');
+  }
+});
+
+/**
+ * CI relizni nashr qiladi.
+ *
+ * Ikki shakl qabul qilinadi:
+ *
+ * 1. `multipart/form-data` — `apk` fayli + `meta` JSON. Server faylni
+ *    saqlaydi va SHA-256 ni O'ZI hisoblaydi. CI yuborgan checksumga
+ *    ishonilmaydi: u faqat solishtirish uchun.
+ * 2. `application/json` — tashqi `downloadUrl` va `sha256` (masalan
+ *    GitHub Releases yoki S3 ishlatilganda).
+ */
+app.post('/v3/internal/releases/publish', async (request, reply) => {
+  if (!releaseTokenValid(request)) {
+    // Sabab aytilmaydi: token noto'g'rimi yoki umuman sozlanmaganmi —
+    // tashqaridan bilib bo'lmasligi kerak.
+    return apiError(reply, 401, 'unauthorized', 'Reliz tokeni yaroqsiz.');
+  }
+  if (!(await enforceRateLimit(request, reply, 'release-publish', 30, 60 * 60))) return;
+
+  const isMultipart = request.isMultipart();
+  let parsed: ReturnType<typeof parseReleaseInput>;
+  let apk: Buffer | null = null;
+  let declaredSha: string | null = null;
+
+  try {
+    if (isMultipart) {
+      // APK 8 MB dan katta, shuning uchun global chegara shu so'rov uchun
+      // ko'tariladi.
+      const file = await request.file({ limits: { fileSize: 200 * 1024 * 1024 } });
+      if (!file) return apiError(reply, 422, 'validation_failed', 'APK fayli topilmadi.');
+      const metaText = multipartFieldValue(file.fields.meta);
+      let meta: unknown;
+      try { meta = JSON.parse(String(metaText || '{}')); } catch {
+        return apiError(reply, 422, 'validation_failed', 'meta JSON noto‘g‘ri.');
+      }
+      apk = await file.toBuffer();
+      if (!apk.length) return apiError(reply, 422, 'validation_failed', 'APK fayli bo‘sh.');
+      parsed = parseReleaseInput(meta);
+      declaredSha = parsed.sha256;
+    } else {
+      parsed = parseReleaseInput(request.body, { requireArtifact: true });
+    }
+  } catch (error) {
+    if (error instanceof ReleaseValidationError) {
+      return apiError(reply, 422, 'validation_failed', error.message, { [error.field]: [error.message] });
+    }
+    throw error;
+  }
+
+  let storageKey: string | null = null;
+  let downloadUrl = parsed.downloadUrl;
+  let fileSize = parsed.fileSize;
+  let sha256 = parsed.sha256;
+
+  if (apk) {
+    // Checksum serverda hisoblanadi. CI yuborgan qiymat mos kelmasa —
+    // artefakt yo'lda buzilgan yoki almashtirilgan.
+    const actual = createHash('sha256').update(apk).digest('hex');
+    if (declaredSha && declaredSha !== actual) {
+      return apiError(reply, 422, 'validation_failed', 'APK checksumi meta ma’lumotiga mos kelmadi.');
+    }
+    sha256 = actual;
+    fileSize = apk.length;
+    storageKey = apkFileName(parsed.appType, parsed.versionCode);
+    await mkdir(resolve(config.apkDir), { recursive: true });
+    await writeFile(resolve(config.apkDir, storageKey), apk);
+    downloadUrl = downloadUrlFor(parsed.appType, parsed.versionCode);
+  }
+
+  const client: PoolClient = await db.connect();
+  try {
+    await client.query('BEGIN');
+    // Bir xil versiya ikkinchi marta yuborilsa (qayta ishga tushirilgan
+    // workflow) yangi yozuv yaratilmaydi, mavjudi yangilanadi.
+    const saved = await client.query(
+      `INSERT INTO app_releases (app_type, platform, version_name, version_code, minimum_supported_version_code,
+         update_type, download_url, storage_key, file_size, sha256, release_notes, is_active, published_via)
+       VALUES ($1::app_type,$2::app_platform,$3,$4,$5,$6::app_update_type,$7,$8,$9,$10,$11::jsonb,true,'ci')
+       ON CONFLICT (app_type, platform, version_code) DO UPDATE SET
+         version_name = EXCLUDED.version_name,
+         minimum_supported_version_code = EXCLUDED.minimum_supported_version_code,
+         update_type = EXCLUDED.update_type,
+         download_url = COALESCE(EXCLUDED.download_url, app_releases.download_url),
+         storage_key = COALESCE(EXCLUDED.storage_key, app_releases.storage_key),
+         file_size = COALESCE(EXCLUDED.file_size, app_releases.file_size),
+         sha256 = COALESCE(EXCLUDED.sha256, app_releases.sha256),
+         release_notes = EXCLUDED.release_notes,
+         is_active = true,
+         published_at = now()
+       RETURNING *`,
+      [
+        parsed.appType, parsed.platform, parsed.versionName, parsed.versionCode,
+        parsed.minimumSupportedVersionCode, parsed.updateType,
+        downloadUrl, storageKey, fileSize, sha256, jsonb(parsed.releaseNotes),
+      ],
+    );
+    await audit(null, 'release.publish', 'app_release', String(saved.rows[0].id), 'CI reliz', {
+      appType: parsed.appType,
+      platform: parsed.platform,
+      versionName: parsed.versionName,
+      versionCode: parsed.versionCode,
+      updateType: parsed.updateType,
+      sha256,
+    }, request, client);
+    await client.query('COMMIT');
+
+    const release = mapRelease(saved.rows[0]);
+    app.log.info({ appType: parsed.appType, versionCode: parsed.versionCode, sha256 }, 'Reliz nashr qilindi');
+
+    // Eski fayllarni tozalash va push — ikkalasi ham relizdan KEYIN va
+    // ikkalasining xatosi ham relizni bekor qilmaydi.
+    void pruneOldApks(parsed.appType).catch((error: unknown) => app.log.warn({ err: error }, 'Eski APK fayllari tozalanmadi'));
+    const push = await sendUpdateToTopic(
+      firebaseAccount,
+      updateTopic(parsed.appType, parsed.platform),
+      updateNotificationText(parsed.appType, parsed.versionName),
+      { type: 'APP_UPDATE', appType: parsed.appType, versionCode: String(parsed.versionCode) },
+    );
+    if (push.sent) app.log.info({ appType: parsed.appType }, 'Yangilanish push xabari yuborildi');
+    else app.log.warn({ appType: parsed.appType, reason: push.reason }, 'Yangilanish push xabari yuborilmadi');
+
+    return reply.status(201).send({ release, push });
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    return failFromError(reply, error, 'release.publish');
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * Diskda faqat oxirgi bir necha reliz qoladi.
+ *
+ * Render'ning doimiy diski 1 GB va uni audio bilan bo'lishadi. Har bir APK
+ * ~35 MB, shuning uchun cheklovsiz to'planish diskni to'ldirib qo'yardi.
+ * Baza yozuvi o'chirilmaydi — faqat fayl.
+ */
+async function pruneOldApks(appType: string): Promise<void> {
+  const stale = await db.query(
+    `SELECT id, storage_key FROM app_releases
+      WHERE app_type=$1::app_type AND platform='ANDROID' AND storage_key IS NOT NULL
+      ORDER BY version_code DESC OFFSET $2`,
+    [appType, config.apkRetention],
+  );
+  for (const row of stale.rows) {
+    const root = resolve(config.apkDir);
+    const target = resolve(root, String(row.storage_key));
+    if (target !== root && target.startsWith(`${root}${sep}`)) {
+      await unlink(target).catch(() => undefined);
+    }
+    await db.query('UPDATE app_releases SET storage_key=NULL WHERE id=$1', [row.id]);
+  }
+}
+
+app.get('/v3/admin/app-releases', async (request, reply) => {
+  if (!(await requirePermission(request, reply, 'releases:read'))) return;
+  const query = request.query as Json;
+  const params: unknown[] = [];
+  const where: string[] = [];
+  const appType = asString(query.appType).toUpperCase();
+  if (appType) {
+    if (!APP_TYPES.includes(appType as never)) return apiError(reply, 422, 'validation_failed', 'appType noto‘g‘ri.');
+    params.push(appType);
+    where.push(`r.app_type=$${params.length}::app_type`);
+  }
+  const rows = await db.query(
+    `SELECT r.*, (SELECT count(*)::int FROM app_devices d
+        WHERE d.app_type = r.app_type AND d.platform = r.platform AND d.app_version_code = r.version_code) AS device_count
+       FROM app_releases r
+      ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
+      ORDER BY r.app_type, r.version_code DESC LIMIT 100`,
+    params,
+  );
+  return { items: rows.rows.map(mapRelease) };
+});
+
+/**
+ * Reliz siyosatini o'zgartirish: majburiylik darajasi, minimal versiya,
+ * izohlar va faollik.
+ *
+ * `isActive=false` — rollback: bu reliz taklif qilinmaydi va tizim
+ * avtomatik ravishda undan oldingi faol relizga qaytadi. Diqqat: bu
+ * SERVER SIYOSATI rollbacki. Android o'rnatilgan ilovani o'zi eski
+ * versiyaga tushira olmaydi — allaqachon yangilangan foydalanuvchida
+ * yangi versiya qolaveradi.
+ */
+app.patch('/v3/admin/app-releases/:id', async (request, reply) => {
+  const claims = await requirePermission(request, reply, 'releases:write');
+  if (!claims) return;
+  const id = asString((request.params as Json).id);
+  if (!isUuid(id)) return apiError(reply, 404, 'not_found', 'Reliz topilmadi.');
+  const body = asObject(request.body);
+  const reason = asString(body.changeReason);
+  if (!reason) return apiError(reply, 422, 'validation_failed', 'O‘zgarish sababi majburiy.', { changeReason: ['Sabab majburiy.'] });
+
+  const current = await db.query('SELECT * FROM app_releases WHERE id=$1', [id]);
+  const previous = current.rows[0];
+  if (!previous) return apiError(reply, 404, 'not_found', 'Reliz topilmadi.');
+
+  const updateType = asString(body.updateType).toUpperCase();
+  if (updateType && !UPDATE_TYPES.includes(updateType as never)) {
+    return apiError(reply, 422, 'validation_failed', 'updateType noto‘g‘ri.');
+  }
+  let minimum: number | null = null;
+  if (body.minimumSupportedVersionCode !== undefined && body.minimumSupportedVersionCode !== null) {
+    minimum = Number(body.minimumSupportedVersionCode);
+    if (!Number.isSafeInteger(minimum) || minimum < 0) {
+      return apiError(reply, 422, 'validation_failed', 'minimumSupportedVersionCode noto‘g‘ri.');
+    }
+    // Relizning o'zi qo'llab-quvvatlanmaydigan bo'lib qolishi mumkin emas.
+    if (minimum > Number(previous.version_code)) {
+      return apiError(reply, 422, 'validation_failed', 'minimumSupportedVersionCode reliz versiyasidan katta bo‘la olmaydi.');
+    }
+  }
+  const notes = Array.isArray(body.releaseNotes)
+    ? body.releaseNotes.map((note) => asString(note)).filter(Boolean).slice(0, 20)
+    : null;
+  const isActive = typeof body.isActive === 'boolean' ? body.isActive : null;
+
+  const client: PoolClient = await db.connect();
+  try {
+    await client.query('BEGIN');
+    const updated = await client.query(
+      `UPDATE app_releases SET
+         update_type = COALESCE($2::app_update_type, update_type),
+         minimum_supported_version_code = COALESCE($3, minimum_supported_version_code),
+         release_notes = COALESCE($4::jsonb, release_notes),
+         is_active = COALESCE($5, is_active)
+       WHERE id=$1 RETURNING *`,
+      [id, updateType || null, minimum, notes ? jsonb(notes) : null, isActive],
+    );
+    const auditLogId = await audit(claims, isActive === false ? 'release.rollback' : 'release.update', 'app_release', id, reason, {
+      appType: previous.app_type,
+      versionCode: Number(previous.version_code),
+      updateType: updateType || previous.update_type,
+      minimumSupportedVersionCode: minimum ?? Number(previous.minimum_supported_version_code),
+      isActive: isActive ?? previous.is_active,
+    }, request, client);
+    await client.query('COMMIT');
+    app.log.info({ releaseId: id, isActive: isActive ?? previous.is_active }, 'Reliz siyosati o‘zgartirildi');
+    return { release: mapRelease(updated.rows[0]), auditLogId };
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    return failFromError(reply, error, 'release.update');
+  } finally {
+    client.release();
   }
 });
 
