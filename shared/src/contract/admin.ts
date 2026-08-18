@@ -202,3 +202,28 @@ export interface IntegrationHealthCheckResponse {
   message: string;
   checkedAt: IsoDateTime;
 }
+
+/**
+ * Server infratuzilmasi holati.
+ *
+ * `integration_secrets` dan farqli: bu integratsiyalar muhit
+ * o'zgaruvchilarida yashaydi va admin panelidan kiritilmaydi. Bu yerdan
+ * hech qanday sir qaytmaydi — faqat sozlangan yoki yo'q.
+ */
+export interface InfrastructureItem {
+  key: string;
+  title: string;
+  status: 'ok' | 'degraded' | 'not_configured';
+  detail: string;
+  configured: boolean;
+  /** Qaysi muhit o'zgaruvchilari kerakligi — qiymatlari emas, nomlari. */
+  envKeys: string[];
+}
+
+export interface InfrastructureResponse {
+  items: InfrastructureItem[];
+  audio: {
+    /** Fayli yo'qolgan audio yozuvlar soni. */
+    missingFiles: number;
+  };
+}

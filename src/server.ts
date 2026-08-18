@@ -3197,6 +3197,76 @@ app.patch('/v3/admin/app-releases/:id', async (request, reply) => {
   }
 });
 
+
+/**
+ * Server tomonidagi infratuzilma holati.
+ *
+ * Bu integratsiyalar `integration_secrets` jadvalida emas, muhit
+ * o'zgaruvchilarida yashaydi (ular server sirlari va admin panelidan
+ * kiritilmaydi). Shu sabab ular «Integratsiyalar» ro'yxatida umuman
+ * ko'rinmasdi va loyiha egasi audio qayerda saqlanayotganini yoki push
+ * ulanganmi-yo'qmi bilolmasdi.
+ *
+ * Bu yerdan HECH QANDAY sir qaytmaydi — faqat «sozlangan» yoki «yo'q».
+ */
+app.get('/v3/admin/infrastructure', async (request, reply) => {
+  if (!(await requirePermission(request, reply, 'integrations:read'))) return;
+
+  const supabaseConfigured = config.storageMode === 'supabase'
+    && Boolean(config.supabaseUrl)
+    && Boolean(config.supabaseServiceRoleKey);
+
+  // Doimiy disk faqat pullik tarifda bo'ladi. Bepul tarifda `local`
+  // rejim har deployda fayllarni yo'qotadi, shuning uchun bu holat
+  // ochiq ogohlantirish sifatida qaytariladi.
+  const localIsDurable = config.uploadDir.startsWith('/var/data/') || config.uploadDir.startsWith('/data/');
+
+  const missingAudio = await db.query<{ total: number }>(
+    'SELECT count(*)::int AS total FROM audio_submissions WHERE NOT storage_available',
+  );
+
+  return {
+    items: [
+      {
+        key: 'audio_storage',
+        title: 'Audio saqlash',
+        status: supabaseConfigured ? 'ok' : 'degraded',
+        detail: supabaseConfigured
+          ? 'Supabase Storage — fayllar deploydan keyin ham saqlanadi.'
+          : localIsDurable
+            ? 'Server diski. Doimiy disk mavjud bo‘lsa fayllar saqlanadi.'
+            : 'Server diski (vaqtinchalik). Fayllar har deployda o‘chadi — Supabase sozlanishi kerak.',
+        configured: supabaseConfigured,
+        envKeys: ['AUDIO_STORAGE_MODE', 'SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'SUPABASE_STORAGE_BUCKET'],
+      },
+      {
+        key: 'push',
+        title: 'Push bildirishnoma (FCM)',
+        status: firebaseAccount ? 'ok' : 'not_configured',
+        detail: firebaseAccount
+          ? 'Firebase ulangan — qurilmalarga xabar yuboriladi.'
+          : 'Sozlanmagan. Ilova yangilanish va xabarlarni har ochilganda o‘zi tekshiradi.',
+        configured: Boolean(firebaseAccount),
+        envKeys: ['FIREBASE_SERVICE_ACCOUNT'],
+      },
+      {
+        key: 'releases',
+        title: 'Reliz nashri (CI)',
+        status: config.releaseToken && config.releaseToken.length >= 24 ? 'ok' : 'not_configured',
+        detail: config.releaseToken && config.releaseToken.length >= 24
+          ? 'CI yangi APK relizini nashr qila oladi.'
+          : 'Reliz tokeni yo‘q — CI nashr qila olmaydi.',
+        configured: Boolean(config.releaseToken && config.releaseToken.length >= 24),
+        envKeys: ['RELEASE_TOKEN'],
+      },
+    ],
+    audio: {
+      // Yo'qolgan yozuvlar soni: loyiha egasi muammo hajmini ko'rishi kerak.
+      missingFiles: Number(missingAudio.rows[0]?.total ?? 0),
+    },
+  };
+});
+
 app.setErrorHandler((error, request, reply) => {
   if ((error as { code?: string }).code === 'FST_REQ_FILE_TOO_LARGE') {
     return apiError(reply, 413, 'payload_too_large', 'Audio 8 MB dan oshmasligi kerak.');
