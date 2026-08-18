@@ -14,7 +14,21 @@ export const config = {
   jwtSecret: env('ADMIN_JWT_SECRET'),
   integrationMasterKey: env('INTEGRATION_MASTER_KEY'),
   corsOrigins: (process.env.CORS_ORIGIN ?? 'http://localhost:8081,http://localhost:19006').split(',').map((item) => item.trim()).filter(Boolean),
-  storageMode: process.env.AUDIO_STORAGE_MODE === 'supabase' ? 'supabase' as const : 'local' as const,
+  /**
+   * Audio qayerda saqlanadi.
+   *
+   * `supabase` — tashqi obyekt xotirasi (eng yaxshi variant, kalit kerak).
+   * `database` — PostgreSQL ichida. Yangi xizmatsiz ishlaydi va deploydan
+   *   keyin ham saqlanadi; talaffuz yozuvlari kichik bo'lgani uchun
+   *   sinov bosqichida bu yetarli.
+   * `local`  — server diski. FAQAT doimiy disk mavjud bo'lganda xavfsiz.
+   *
+   * Sukut bo'yicha `database`: bepul hostingda doimiy disk yo'q va
+   * `local` jimgina ma'lumot yo'qotishga olib kelardi.
+   */
+  storageMode: (process.env.AUDIO_STORAGE_MODE === 'supabase' ? 'supabase'
+    : process.env.AUDIO_STORAGE_MODE === 'local' ? 'local'
+    : 'database') as 'supabase' | 'database' | 'local',
   uploadDir: process.env.AUDIO_UPLOAD_DIR ?? './var/uploads',
   supabaseUrl: process.env.SUPABASE_URL,
   supabaseServiceRoleKey: process.env.SUPABASE_SERVICE_ROLE_KEY,

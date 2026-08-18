@@ -286,7 +286,15 @@ async function primaryAudioFor(wordId: string): Promise<{ id: string; playbackUr
   // ketgan. Bunday yozuv uchun havola berish foydalanuvchiga ishlamaydigan
   // tugma ko'rsatish bilan barobar, shuning uchun avval fayl borligini
   // tekshiramiz va yo'q bo'lsa "talaffuz yo'q" deymiz.
-  if (row.storage_bucket === 'local') {
+  if (row.storage_bucket === 'database') {
+    // Bayt massivi yozuv bilan bir tranzaksiyada saqlanadi va u bilan
+    // birga o'chadi, shuning uchun alohida mavjudlik tekshiruvi kerak emas.
+    const blob = await db.query('SELECT 1 FROM audio_blobs WHERE audio_submission_id = $1', [row.id]);
+    if (!blob.rows[0]) {
+      await markAudioMissing(String(row.id), 'bazada bayt massivi yo‘q');
+      return null;
+    }
+  } else if (row.storage_bucket === 'local') {
     const uploadRoot = resolve(config.uploadDir);
     const audioPath = resolve(uploadRoot, String(row.storage_key));
     if (audioPath !== uploadRoot && !audioPath.startsWith(`${uploadRoot}${sep}`)) {
@@ -455,7 +463,10 @@ function practicalMobileGate(sample: Json, geofences: Awaited<ReturnType<typeof 
 async function createPlaybackAccess(row: QueryResultRow): Promise<{ playbackUrl: string; playbackUrlExpiresAt: string }> {
   const audioId = String(row.audio_id ?? row.id);
   const expiresAt = new Date(Date.now() + 5 * 60_000).toISOString();
-  if (row.storage_bucket === 'local') {
+  // Baza ham, lokal disk ham bir xil yo'ldan uzatiladi: qisqa muddatli
+  // imzolangan havola. Havola muddati tugashi yozuvni buzmaydi —
+  // ilova keyingi so'rovda yangisini oladi.
+  if (row.storage_bucket === 'database' || row.storage_bucket === 'local') {
     const signed = await signAudioPlaybackToken(audioId);
     return {
       playbackUrl: `${config.publicBaseUrl}/v3/audio/${encodeURIComponent(audioId)}?token=${encodeURIComponent(signed.token)}`,
@@ -671,6 +682,10 @@ async function loadIntegrationSecret(provider: string): Promise<string | null> {
 }
 async function storeAudio(buffer: Buffer, filename: string, mimeType: string): Promise<{ bucket: string; key: string }> {
   const key = `${new Date().toISOString().slice(0, 10)}/${newId()}-${basename(filename).replace(/[^a-zA-Z0-9._-]/g, '_')}`;
+  // Baza rejimida bayt massivi audio yozuvi yaratilgandan KEYIN yoziladi
+  // (unga `audio_submission_id` kerak), shuning uchun bu yerda faqat
+  // kalit qaytariladi.
+  if (config.storageMode === 'database') return { bucket: 'database', key };
   if (config.storageMode === 'supabase') {
     const response = await fetch(`${config.supabaseUrl}/storage/v1/object/${config.supabaseBucket}/${key}`, { method: 'POST', headers: { Authorization: `Bearer ${config.supabaseServiceRoleKey}`, apikey: config.supabaseServiceRoleKey!, 'Content-Type': mimeType, 'x-upsert': 'false' }, body: new Uint8Array(buffer) });
     if (!response.ok) throw new Error('Supabase Storage audio qabul qilmadi.');
@@ -683,6 +698,9 @@ async function storeAudio(buffer: Buffer, filename: string, mimeType: string): P
 }
 
 async function deleteStoredAudio(stored: { bucket: string; key: string }): Promise<void> {
+  // Bazadagi bayt massivi `audio_submissions` bilan birga kaskadda
+  // o'chadi, shuning uchun bu yerda alohida ish yo'q.
+  if (stored.bucket === 'database') return;
   if (stored.bucket === 'local') {
     await unlink(join(config.uploadDir, stored.key)).catch(() => undefined);
     return;
@@ -2151,10 +2169,18 @@ app.post('/v3/contributions/audio', async (request, reply) => {
     if (supersededAudioId) {
       await client.query('UPDATE audio_submissions SET superseded_at=now() WHERE id=$1', [supersededAudioId]);
     }
-    const created = await client.query(`INSERT INTO audio_submissions (contribution_request_id, word_id, storage_bucket, storage_key, mime_type, duration_ms, size_bytes, checksum_sha256, expected_text, moderation_status, idempotency_key, version)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending',$10,$11) RETURNING *`, [contributionRequestId, wordId, stored.bucket, stored.key, file.mimetype, durationMs, buffer.length, checksumSha256, expectedText, idempotencyKey, nextVersion]);
+    const created = await client.query(`INSERT INTO audio_submissions (contribution_request_id, word_id, storage_bucket, storage_key, mime_type, duration_ms, size_bytes, checksum_sha256, expected_text, moderation_status, idempotency_key, version, storage_provider)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending',$10,$11,$12::audio_storage_provider) RETURNING *`, [contributionRequestId, wordId, stored.bucket, stored.key, file.mimetype, durationMs, buffer.length, checksumSha256, expectedText, idempotencyKey, nextVersion, stored.bucket === 'database' ? 'database' : stored.bucket === 'local' ? 'local' : 'supabase']);
     if (supersededAudioId) {
       await client.query('UPDATE audio_submissions SET superseded_by=$2 WHERE id=$1', [supersededAudioId, created.rows[0].id]);
+    }
+    if (stored.bucket === 'database') {
+      // Yozuv bilan bir tranzaksiyada: audio qatori bor, bayt massivi
+      // yo'q degan holat umuman yuzaga kelmaydi.
+      await client.query(
+        'INSERT INTO audio_blobs (audio_submission_id, content, size_bytes, mime_type) VALUES ($1,$2,$3,$4)',
+        [created.rows[0].id, buffer, buffer.length, file.mimetype],
+      );
     }
     await client.query('COMMIT');
     transactionOpen = false;
@@ -2667,8 +2693,25 @@ app.get('/v3/audio/:id', async (request, reply) => {
 
   const row = (await db.query('SELECT * FROM audio_submissions WHERE id=$1', [audioId])).rows[0];
   if (!row) return apiError(reply, 404, 'not_found', 'Audio topilmadi.');
+  if (row.storage_bucket === 'database') {
+    const blob = await db.query<{ content: Buffer; mime_type: string }>(
+      'SELECT content, mime_type FROM audio_blobs WHERE audio_submission_id = $1',
+      [audioId],
+    );
+    const stored = blob.rows[0];
+    if (!stored) {
+      await markAudioMissing(audioId, 'bazada bayt massivi yo‘q');
+      return apiError(reply, 404, 'not_found', 'Audio fayl topilmadi.');
+    }
+    return reply
+      .type(String(stored.mime_type ?? row.mime_type))
+      .header('Accept-Ranges', 'none')
+      .header('Cache-Control', 'private, max-age=300')
+      .header('Content-Length', String(stored.content.length))
+      .send(stored.content);
+  }
   // Supabase obyektlari `createPlaybackAccess` bergan native 5 daqiqalik
-  // storage URL orqali tinglanadi; bu endpoint faqat private local diskdir.
+  // storage URL orqali tinglanadi; qolgani private local diskdir.
   if (row.storage_bucket !== 'local') return apiError(reply, 409, 'storage_mismatch', 'Bu audio uchun storage havolasidan foydalaning.');
 
   const uploadRoot = resolve(config.uploadDir);
@@ -3230,13 +3273,15 @@ app.get('/v3/admin/infrastructure', async (request, reply) => {
       {
         key: 'audio_storage',
         title: 'Audio saqlash',
-        status: supabaseConfigured ? 'ok' : 'degraded',
+        status: supabaseConfigured || config.storageMode === 'database' ? 'ok' : 'degraded',
         detail: supabaseConfigured
           ? 'Supabase Storage — fayllar deploydan keyin ham saqlanadi.'
-          : localIsDurable
-            ? 'Server diski. Doimiy disk mavjud bo‘lsa fayllar saqlanadi.'
-            : 'Server diski (vaqtinchalik). Fayllar har deployda o‘chadi — Supabase sozlanishi kerak.',
-        configured: supabaseConfigured,
+          : config.storageMode === 'database'
+            ? 'PostgreSQL ichida — fayllar deploydan keyin ham saqlanadi. Yozuvlar ko‘payganda Supabase’ga o‘tish tavsiya etiladi.'
+            : localIsDurable
+              ? 'Server diski. Doimiy disk mavjud bo‘lsa fayllar saqlanadi.'
+              : 'Server diski (vaqtinchalik). Fayllar har deployda o‘chadi.',
+        configured: supabaseConfigured || config.storageMode === 'database',
         envKeys: ['AUDIO_STORAGE_MODE', 'SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'SUPABASE_STORAGE_BUCKET'],
       },
       {
