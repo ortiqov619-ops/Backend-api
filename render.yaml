@@ -22,16 +22,15 @@ services:
         value: https://xorazm-shevalari-backend-api.onrender.com
       - key: TRUST_PROXY
         value: "true"
-      # Reliz APK'lari audio bilan bir xil doimiy diskda turadi.
-      - key: APK_UPLOAD_DIR
-        value: /var/data/apk
-      # Har bir ilova turi uchun diskda saqlanadigan reliz soni.
-      - key: APK_RETENTION
-        value: "5"
-      # Yuklab olish Cloudflare orqali ketadi: Render'ga to'g'ridan-to'g'ri
-      # ulanish O'zbekistondan juda sekin.
-      - key: PUBLIC_DOWNLOAD_BASE_URL
-        value: https://xorazm-api.ortiqov619.workers.dev
+      # DIQQAT: bepul tarifda doimiy disk YO'Q. Shuning uchun reliz
+      # APK'lari backend diskida saqlanmaydi — ular ochiq
+      # `xorazm-shevalari-releases` repozitoriyasining Releases bo'limida
+      # turadi va backend faqat havola bilan checksumni saqlaydi.
+      #
+      # `APK_UPLOAD_DIR` faqat backendning o'zi APK qabul qiladigan
+      # (multipart) yo'l uchun kerak. Doimiy disk paydo bo'lgandagina
+      # ma'noga ega bo'ladi.
+      #
       # CI reliz nashr qilish tokeni — Render panelidan kiritiladi.
       - key: RELEASE_TOKEN
         sync: false
