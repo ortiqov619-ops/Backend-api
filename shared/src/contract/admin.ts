@@ -73,7 +73,8 @@ export type AuditAction =
   | 'release.rollback'
   | 'user.role_change'
   | 'app_user.block'
-  | 'app_user.unblock';
+  | 'app_user.unblock'
+  | 'content.update';
 
 export type AuditEntityType =
   | 'user'
@@ -84,7 +85,8 @@ export type AuditEntityType =
   | 'geofence'
   | 'dialect'
   | 'integration_secret'
-  | 'app_release';
+  | 'app_release'
+  | 'app_content';
 
 export interface AuditLogEntry {
   id: Uuid;

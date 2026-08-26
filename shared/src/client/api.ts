@@ -1,4 +1,9 @@
 import type {
+  AppContentResponse,
+  UpdateAppContentRequest,
+  UpdateAppContentResponse,
+} from '../contract/appContent';
+import type {
   AuditLogQuery,
   AuditLogResponse,
   DashboardResponse,
@@ -102,8 +107,18 @@ export class XorazmApiClient {
 
   /* ---------------------------- dictionary --------------------------- */
 
-  listWords(query?: WordListQuery): Promise<WordListResponse> {
-    return this.http.request('GET', '/words', { query: toQuery(query), auth: false });
+  /**
+   * Lug'at ro'yxati.
+   *
+   * Ochiq ro'yxat (`authenticated` berilmagan) har doim faqat nashr
+   * etilgan so'zlarni qaytaradi — server buni majburlaydi. Admin paneli
+   * qoralama/arxiv filtrini ishlata olishi uchun so'rovni tokeni bilan
+   * yuborishi SHART: ilgari u tokensiz yuborilar edi va server har qanday
+   * `status` filtrini jimgina «published» ga almashtirardi — moderator
+   * esa filtr ishlamayapti deb ko'rardi.
+   */
+  listWords(query?: WordListQuery, options?: { authenticated?: boolean }): Promise<WordListResponse> {
+    return this.http.request('GET', '/words', { query: toQuery(query), auth: options?.authenticated === true });
   }
 
   getWord(id: Uuid): Promise<Word> {
@@ -271,6 +286,21 @@ export class XorazmApiClient {
 
   auditLogs(query?: AuditLogQuery): Promise<AuditLogResponse> {
     return this.http.request('GET', '/admin/audit-logs', { query: toQuery(query) });
+  }
+
+  /* --------------------------- ilova matni --------------------------- */
+
+  /** Ochiq: «Biz haqimizda» matni va havolalar. Token talab qilmaydi. */
+  appContent(): Promise<AppContentResponse> {
+    return this.http.request('GET', '/app/content', { auth: false });
+  }
+
+  adminAppContent(): Promise<AppContentResponse> {
+    return this.http.request('GET', '/admin/app-content', {});
+  }
+
+  updateAppContent(body: UpdateAppContentRequest): Promise<UpdateAppContentResponse> {
+    return this.http.request('PUT', '/admin/app-content', { body });
   }
 
   integrations(): Promise<IntegrationListResponse> {

@@ -20,16 +20,21 @@ export * from './contract/telemetry';
 export * from './contract/community';
 export * from './contract/notifications';
 export * from './contract/appUpdates';
+export * from './contract/appContent';
 export * from './updates/policy';
+export * from './launch/intro';
 
 export * from './geo/polygon';
 export * from './geo/gate';
 export * from './geo/xorazm';
+export * from './geo/hierarchy';
 
 export * from './validation/phonetics';
 export * from './validation/lexicon';
 export * from './validation/text';
 export * from './validation/audio';
+
+export * from './text/script';
 
 export * from './client/http';
 export * from './client/api';

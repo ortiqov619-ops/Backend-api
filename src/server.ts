@@ -6,7 +6,7 @@ import cors from '@fastify/cors';
 import multipart from '@fastify/multipart';
 import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify';
 import { Pool, type PoolClient, type QueryResultRow } from 'pg';
-import { AUDIO_LIMITS, evaluateLocationGate, phoneticKey, validateContributionText } from '@xorazm/shared';
+import { AUDIO_LIMITS, evaluateLocationGate, FALLBACK_APP_CONTENT, phoneticKey, REGION_LEVELS, validateContributionText } from '@xorazm/shared';
 import { fixedWindow, normalizeExpectedText, sameAudioFingerprint, type AudioIdempotencyFingerprint } from './audio-hardening';
 import {
   audioStatusForRequestDecision,
@@ -36,6 +36,7 @@ import {
   isDirectVillageChild,
   uniqueDialectIdByLabel,
   normalizeRegionName,
+  parseLocalIdentifier,
   parseRegionSuggestion,
   resolveRegionForPublication,
   RegionSuggestionValidationError,
@@ -61,7 +62,15 @@ import {
   PatternValidationError,
   remainingLockMs,
 } from './pattern-auth';
-import { INSERT_VALIDATION_RESULT, jsonb, UPDATE_REQUEST_RESOLUTION } from './sql';
+import {
+  DELETE_MISSING_CONTENT_LINKS,
+  INSERT_APP_CONTENT_LINK,
+  INSERT_VALIDATION_RESULT,
+  jsonb,
+  UPDATE_APP_CONTENT_LINK,
+  UPDATE_REQUEST_RESOLUTION,
+  UPSERT_APP_CONTENT,
+} from './sql';
 import { iso, requiredIso } from './timestamps';
 import {
   APP_TYPES,
@@ -74,6 +83,10 @@ import {
   UPDATE_TYPES,
 } from './app-releases';
 import { parseServiceAccount, sendUpdateToTopic } from './fcm';
+import { AppContentValidationError, parseAppContentUpdate } from './app-content';
+import { submitterDisplayName } from './guest-identity';
+import { buildWordListFilters, WordFilterValidationError } from './word-filters';
+import { appFeaturesFrom, SUPPORTED_INTEGRATIONS } from './feature-gate';
 
 assertProductionConfig();
 // Service account bir marta o'qiladi. Sozlanmagan bo'lsa `null` bo'lib
@@ -217,7 +230,7 @@ async function audit(actor: Claims | null, action: string, entityType: string, e
 }
 
 function mapRegion(row: QueryResultRow) {
-  return { id: row.id, code: row.code, nameUz: row.name_uz, nameOz: row.name_oz, parentId: row.parent_id, level: row.level, isContributionAllowed: row.is_contribution_allowed, createdAt: iso(row.created_at), updatedAt: iso(row.updated_at) };
+  return { id: row.id, code: row.code, nameUz: row.name_uz, nameOz: row.name_oz, formerName: row.former_name ?? null, parentId: row.parent_id, level: row.level, isContributionAllowed: row.is_contribution_allowed, createdAt: iso(row.created_at), updatedAt: iso(row.updated_at) };
 }
 function mapFence(row: QueryResultRow) {
   return { id: row.id, regionId: row.region_id, name: row.name, area: row.area_geojson, policy: row.policy, isActive: row.is_active, version: row.version, note: row.note, createdAt: requiredIso(row.created_at), updatedAt: requiredIso(row.updated_at) };
@@ -619,11 +632,8 @@ const INTEGRATION_SELECT = `SELECT s.*, u.full_name AS last_rotated_by_name
   FROM integration_secrets s
   LEFT JOIN users u ON u.id = s.last_rotated_by`;
 
-/**
- * Serverda haqiqiy mijozi bor providerlar. Qolganlari uchun kalit saqlanadi,
- * lekin hech qayerda ishlatilmaydi — panel buni ochiq ko'rsatishi kerak.
- */
-const SUPPORTED_INTEGRATIONS = new Set(['stt_primary']);
+// Serverda haqiqiy mijozi bor providerlar ro'yxati `feature-gate.ts` da:
+// u yerda ilovaga qaysi imkoniyat ko'rsatilishi ham hal qilinadi.
 
 function mapIntegration(row: QueryResultRow) {
   return {
@@ -884,6 +894,28 @@ async function optionalAppUser(request: FastifyRequest): Promise<QueryResultRow 
   }
 }
 
+/**
+ * Tokenga tegishli hisob bloklanganmi.
+ *
+ * `optionalAppUser` bloklangan hisob uchun ham `null` qaytaradi, ya'ni
+ * "hisob yo'q" va "hisob bloklangan" farqlanmaydi. Hissa qo'shish
+ * hisobsiz ham ochiq bo'lgani uchun bu farq muhim: aks holda
+ * bloklangan odam o'z tokeni bilan mehmon sifatida yozishda davom
+ * etardi va bloklash ma'nosini yo'qotardi.
+ */
+async function blockedAppUserFor(request: FastifyRequest): Promise<QueryResultRow | null> {
+  const authorization = request.headers.authorization;
+  if (!authorization?.startsWith('Bearer ')) return null;
+  try {
+    const { sub } = await verifyAppUserToken(authorization.slice(7));
+    const found = await db.query(`SELECT id, blocked_at, blocked_reason FROM users WHERE id=$1::uuid AND kind='app'`, [sub]);
+    const user = found.rows[0];
+    return user?.blocked_at ? user : null;
+  } catch {
+    return null;
+  }
+}
+
 function mapNotification(row: QueryResultRow) {
   return {
     id: String(row.id),
@@ -1073,21 +1105,14 @@ app.get('/v3/app/features', async () => {
             (secret_ciphertext IS NOT NULL) AS has_secret
        FROM integration_secrets`,
   );
-  const live = new Set(
-    rows.rows
-      .filter((row) => SUPPORTED_INTEGRATIONS.has(String(row.provider)))
-      .filter((row) => row.is_enabled && row.has_secret && row.health !== 'failing')
-      .map((row) => String(row.provider)),
-  );
+  // Qaror `feature-gate.ts` da — u sof funksiya va test bilan qoplangan.
   return {
-    features: {
-      /** Yozilgan ovozni matnga o'girish. */
-      transcription: live.has('stt_primary'),
-      /** Push bildirishnomalar — serverda mijozi hali yozilmagan. */
-      pushNotifications: live.has('push_notifications'),
-      /** Sheva mosligini avtomatik baholash — serverda mijozi yo'q. */
-      dialectScoring: live.has('dialect_model'),
-    },
+    features: appFeaturesFrom(rows.rows.map((row) => ({
+      provider: String(row.provider),
+      isEnabled: Boolean(row.is_enabled),
+      hasSecret: Boolean(row.has_secret),
+      health: String(row.health),
+    }))),
   };
 });
 
@@ -1789,7 +1814,31 @@ app.post('/v3/admin/regions', async (request, reply) => {
   const body = asObject(request.body); const nameUz = asString(body.nameUz); const code = asString(body.code).toLowerCase(); const reason = asString(body.changeReason);
   const level = asString(body.level) || 'region';
   if (!nameUz || !code || !reason) return apiError(reply, 422, 'validation_failed', 'Hudud nomi, kodi va o‘zgarish sababi majburiy.');
-  if (!['region','district','village','neighborhood'].includes(level)) return apiError(reply, 422, 'validation_failed', 'Hudud darajasi noto‘g‘ri.');
+  if (!REGION_LEVELS.includes(level as (typeof REGION_LEVELS)[number])) return apiError(reply, 422, 'validation_failed', 'Hudud darajasi noto‘g‘ri.');
+
+  let formerName: string | null;
+  try {
+    formerName = parseLocalIdentifier(body.formerName, 'formerName');
+  } catch (error) {
+    if (error instanceof RegionSuggestionValidationError) {
+      return apiError(reply, 422, 'validation_failed', error.message, { [error.field]: [error.message] });
+    }
+    throw error;
+  }
+
+  // Respublika/davlat ierarxiyaning ildizi: ustida hudud bo'lmaydi.
+  if (level === 'republic') {
+    try {
+      const created = await db.query(`INSERT INTO regions (code,name_uz,former_name,parent_id,level,is_contribution_allowed,sort_order,created_by,updated_by)
+        VALUES ($1,$2,$3,NULL,'republic',false,COALESCE((SELECT max(sort_order)+1 FROM regions),1),$4,$4) RETURNING *`, [code,nameUz,formerName,claims.sub]);
+      await audit(claims, 'region.update', 'region', created.rows[0].id, reason, { action:'create', code, nameUz, level, isContributionAllowed:false }, request);
+      return reply.status(201).send({ region: mapRegion(created.rows[0]) });
+    } catch (error) {
+      if ((error as { code?: string }).code === '23505') return apiError(reply, 409, 'conflict', 'Bunday hudud kodi allaqachon mavjud.');
+      throw error;
+    }
+  }
+
   const parentId = asString(body.parentId) || (level === 'region' ? '00000000-0000-4000-8000-000000000000' : '');
   if (!isUuid(parentId)) return apiError(reply, 422, 'validation_failed', 'Yuqori hududni tanlash majburiy.');
   const parent = await db.query('SELECT id, level::text, is_contribution_allowed FROM regions WHERE id=$1', [parentId]);
@@ -1800,9 +1849,9 @@ app.post('/v3/admin/regions', async (request, reply) => {
     return apiError(reply, 422, 'validation_failed', 'Yopiq yuqori hudud ostida hissa hududi yaratib bo‘lmaydi.');
   }
   try {
-    const created = await db.query(`INSERT INTO regions (code,name_uz,parent_id,level,is_contribution_allowed,sort_order,created_by,updated_by)
-      VALUES ($1,$2,$3,$4,false,COALESCE((SELECT max(sort_order)+1 FROM regions),1),$5,$5) RETURNING *`, [code,nameUz,parentId,level,claims.sub]);
-    await audit(claims, 'region.update', 'region', created.rows[0].id, reason, { action:'create', code, nameUz, level, isContributionAllowed:false }, request);
+    const created = await db.query(`INSERT INTO regions (code,name_uz,former_name,parent_id,level,is_contribution_allowed,sort_order,created_by,updated_by)
+      VALUES ($1,$2,$3,$4,$5,false,COALESCE((SELECT max(sort_order)+1 FROM regions),1),$6,$6) RETURNING *`, [code,nameUz,formerName,parentId,level,claims.sub]);
+    await audit(claims, 'region.update', 'region', created.rows[0].id, reason, { action:'create', code, nameUz, level, formerName, isContributionAllowed:false }, request);
     return reply.status(201).send({ region: mapRegion(created.rows[0]) });
   } catch (error) {
     if ((error as { code?: string }).code === '23505') return apiError(reply, 409, 'conflict', 'Bunday hudud kodi allaqachon mavjud.');
@@ -1821,15 +1870,28 @@ app.patch('/v3/admin/regions/:id', async (request, reply) => {
   return { region: mapRegion(updated.rows[0]) };
 });
 
-app.get('/v3/words', async (request) => {
-  const query = request.query as Json; const requester = await claimsFor(request); const params: unknown[] = []; const where: string[] = [];
-  if (!requester || !query.status) where.push(`w.status = 'published'`); else { params.push(query.status); where.push(`w.status = $${params.length}`); }
-  if (query.search) { params.push(`%${asString(query.search)}%`); where.push(`(w.word ILIKE $${params.length} OR w.meaning ILIKE $${params.length})`); }
-  if (query.regionId) { params.push(query.regionId); where.push(`(w.region_id=$${params.length} OR w.district_id=$${params.length})`); }
-  if (query.dialectId) { params.push(query.dialectId); where.push(`w.dialect_id=$${params.length}`); }
-  if (query.category) { params.push(query.category); where.push(`w.category=$${params.length}`); }
+/**
+ * Lug'at ro'yxati — ochiq va admin uchun bitta endpoint.
+ *
+ * Ochiq so'rov (token yo'q yoki `words:read` ruxsati yo'q) har doim
+ * faqat `published` so'zlarni oladi. Holat, audio va hudud filtrlari
+ * `word-filters.ts` da yig'iladi va o'sha yerda test qilinadi.
+ */
+app.get('/v3/words', async (request, reply) => {
+  const query = request.query as Json;
+  const isAdmin = Boolean(await claimsFor(request, 'words:read'));
+  let filters: ReturnType<typeof buildWordListFilters>;
+  try {
+    filters = buildWordListFilters(query, { isAdmin, hasAudioSql: WORD_HAS_AUDIO_SQL });
+  } catch (error) {
+    if (error instanceof WordFilterValidationError) {
+      return apiError(reply, 422, 'validation_failed', error.message, { [error.field]: [error.message] });
+    }
+    throw error;
+  }
+  const { clause } = filters;
+  const params = [...filters.params];
   const current = page(query.page); const size = pageSize(query.pageSize); const order = query.sort === 'alphabetical' ? 'w.word ASC' : 'w.created_at DESC';
-  const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const count = await db.query(`SELECT count(*)::int AS total FROM words w ${clause}`, params);
   params.push(size, (current - 1) * size);
   // Ro'yxatda audio havolasi yaratilmaydi — faqat borligi. Har bir yozuv
@@ -1882,17 +1944,28 @@ app.post('/v3/contributions/words', async (request, reply) => {
   if (!asString(payload.word) || !asString(payload.meaning) || !key) return apiError(reply, 422, 'validation_failed', 'So‘z, ma’no va idempotency kaliti majburiy.');
   const existing = await db.query(`${requestSql} WHERE cr.idempotency_key=$1`, [key]); if (existing.rows[0]) return { request: await mapRequest(existing.rows[0]), userMessage: 'Avvalgi so‘rov qaytarildi.' };
   /**
-   * Hissa qo'shish hisob talab qiladi.
+   * Hissa qo'shish hisobsiz ham mumkin.
    *
-   * Ilgari u ixtiyoriy edi va natijada egasiz so'zlar ommaviy lug'atga
-   * tushardi: moderator kim yuborganini bilmasdi, muallifga qaror haqida
-   * xabar bormasdi va so'z hech kimga tegishli bo'lmay qolardi
-   * (`words.created_by = NULL`).
+   * Hisob ixtiyoriy: mehmon ham so'z yubora oladi va moderator uni
+   * `Mehmon A1` ko'rinishidagi barqaror, anonim yorliq bilan ko'radi —
+   * shu tufayli takroriy yoki spam yuborishni baribir kuzatib bo'ladi,
+   * lekin qurilma identifikatori ekranga chiqmaydi.
    *
-   * Lug'atni O'QISH ochiq bo'lib qoladi — faqat yozish hisobga bog'landi.
+   * Hisob bo'lsa taklif unga bog'lanadi: nomi ko'rinadi, qaror haqida
+   * xabar keladi va `words.created_by` to'ldiriladi. Bloklangan hisob
+   * `optionalAppUser` dan `null` qaytadi — bunday odam mehmon sifatida
+   * ham yoza olmasligi uchun quyida alohida tekshiriladi.
    */
-  const submitter = await requireAppUser(request, reply);
-  if (!submitter) return;
+  const submitter = await optionalAppUser(request);
+  if (!submitter && request.headers.authorization?.startsWith('Bearer ')) {
+    // Token bor, lekin hisob yo'q/bloklangan: buni jimgina mehmonga
+    // aylantirish bloklashni chetlab o'tish yo'li bo'lardi.
+    const blocked = await blockedAppUserFor(request);
+    if (blocked) {
+      return apiError(reply, 403, 'account_blocked', `Hisobingiz bloklangan. Sabab: ${blocked.blocked_reason ?? 'ko‘rsatilmagan'}`);
+    }
+  }
+  const submitterInstallationId = asString(device.installationId);
   const geofences = await activeFences(); const heritageDeclaration = bool(body.heritageDeclaration);
   const hasLocation = Number.isFinite(Number(location.latitude)) && Number.isFinite(Number(location.longitude));
   const gate = hasLocation ? practicalMobileGate(location, geofences) : null;
@@ -2007,20 +2080,55 @@ app.post('/v3/contributions/words', async (request, reply) => {
       });
     }
   }
+  // Erkin matnli hudud maydonlari: mahalla nomi va urug'/laqab. Ular
+  // katalogga bog'lanmaydi, shuning uchun bu yerda cheklanadi.
+  try {
+    for (const [field, maxLength] of [['neighborhood', 80], ['clan', 60]] as const) {
+      const normalized = parseLocalIdentifier(payload[field], `payload.${field}`, { maxLength });
+      if (normalized) payload[field] = normalized;
+      else delete payload[field];
+    }
+  } catch (error) {
+    if (error instanceof RegionSuggestionValidationError) {
+      return apiError(reply, 422, 'validation_failed', error.message, { [error.field]: [error.message] });
+    }
+    throw error;
+  }
+
+  // Lahja tanlovi darhol tekshiriladi: ilova ro'yxatni serverdan oladi,
+  // shuning uchun noto'g'ri qiymat mijoz nuqsoni bo'ladi va uni
+  // tasdiqlash vaqtiga qoldirish foydalanuvchidan tanlovni yashirardi.
+  const requestedDialectId = asString(payload.dialectId);
+  if (requestedDialectId) {
+    if (!isUuid(requestedDialectId)) {
+      return apiError(reply, 422, 'validation_failed', 'Tanlangan lahja identifikatori noto‘g‘ri.', { 'payload.dialectId': ['Lahjani qayta tanlang.'] });
+    }
+    const dialect = await db.query('SELECT 1 FROM dialects WHERE id=$1 AND is_active=true', [requestedDialectId]);
+    if (!dialect.rows[0]) {
+      return apiError(reply, 422, 'validation_failed', 'Tanlangan lahja faol emas.', { 'payload.dialectId': ['Lahjani qayta tanlang.'] });
+    }
+  } else {
+    delete payload.dialectId;
+  }
+
   const duplicates = await db.query('SELECT id, word, phonetic_key FROM words WHERE status <> \'archived\'');
   const validation = validateContributionText({ payload: payload as never, locationGate: null, duplicateCandidates: duplicates.rows.map((row) => ({ id: row.id, word: row.word, phoneticKey: row.phonetic_key })), origin: 'server', thresholds: { rejectBelow:0, autoQueueAbove:65, minConfidenceForVerdict:0.5 } });
   if (validation.verdict === 'rejected') return apiError(reply, 422, 'validation_failed', 'So‘z avtomatik tekshiruvdan o‘tmadi.');
-  const submitterName = String(submitter.display_name ?? submitter.full_name ?? '');
+  // Mehmon yozuvi `submitted_by_user_id = NULL` bilan saqlanadi va
+  // moderatorga anonim yorliq bilan ko'rinadi.
+  const submitterName = submitterDisplayName(submitter, submitterInstallationId);
   const created = await db.query(`INSERT INTO contribution_requests (payload, device, idempotency_key, latitude, longitude, location_accuracy_m, location_checked_at, submission_location_status, matched_geofence_id, geofence_version, distance_to_boundary_m, is_location_mocked, validation_verdict, validation_score, requires_human_review, submitted_by_user_id, submitted_by_display_name)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::uuid,$17) RETURNING id`, [payload, { ...device, heritageDeclaration }, key, hasLocation ? location.latitude : null, hasLocation ? location.longitude : null, hasLocation ? location.accuracy : null, hasLocation ? location.capturedAt : null, hasLocation ? gate?.status ?? 'not_provided' : 'not_provided', gate?.matchedGeofenceId ?? null, geofences.find((f) => f.id === gate?.matchedGeofenceId)?.version ?? null, gate?.distanceToBoundaryM ?? null, hasLocation ? location.isMocked ?? null : null, validation.verdict, validation.score, true, submitter.id, submitterName]);
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::uuid,$17) RETURNING id`, [payload, { ...device, heritageDeclaration }, key, hasLocation ? location.latitude : null, hasLocation ? location.longitude : null, hasLocation ? location.accuracy : null, hasLocation ? location.capturedAt : null, hasLocation ? gate?.status ?? 'not_provided' : 'not_provided', gate?.matchedGeofenceId ?? null, geofences.find((f) => f.id === gate?.matchedGeofenceId)?.version ?? null, gate?.distanceToBoundaryM ?? null, hasLocation ? location.isMocked ?? null : null, validation.verdict, validation.score, true, submitter?.id ?? null, submitterName]);
   const requestId = created.rows[0].id;
   await db.query(INSERT_VALIDATION_RESULT, [requestId, validation.subject, validation.verdict, validation.score, validation.confidence, jsonb(validation.reasons), validation.engine.kind, validation.engine.name, validation.engine.version, validation.origin, geofences.find((f) => f.id === gate?.matchedGeofenceId)?.version ?? null]);
   await notifyModerators(
     submissionNotification('new', asString(payload.word), submitterName),
     'contribution_request',
     String(requestId),
-    { word: asString(payload.word), meaning: asString(payload.meaning) },
-    String(submitter.id),
+    { word: asString(payload.word), meaning: asString(payload.meaning), submittedByDisplayName: submitterName, isGuest: !submitter },
+    // Mehmon uchun `actorUserId` bo'sh: `notifications.actor_user_id`
+    // nullable va `deliver()` buni qo'llab-quvvatlaydi.
+    submitter ? String(submitter.id) : null,
   );
   const record = await db.query(`${requestSql} WHERE cr.id=$1`, [requestId]); return {
     request: await mapRequest(record.rows[0]),
@@ -2559,6 +2667,132 @@ app.get('/v3/admin/dashboard', async (request, reply) => {
     trend: trend.rows.map((row) => ({ date: String(row.day instanceof Date ? row.day.toISOString().slice(0, 10) : row.day), submitted: Number(row.submitted), approved: Number(row.approved), rejected: Number(row.rejected) })),
     generatedAt: new Date().toISOString(),
   };
+});
+
+/* ----------------------------- ilova matni ---------------------------- */
+
+const APP_CONTENT_KEY = 'about';
+
+function mapContentLink(row: QueryResultRow) {
+  return {
+    id: String(row.id),
+    kind: String(row.kind),
+    label: String(row.label),
+    value: String(row.value),
+    url: String(row.url),
+    sortOrder: Number(row.sort_order ?? 0),
+    isActive: Boolean(row.is_active),
+  };
+}
+
+/**
+ * «Biz haqimizda» sahifasi.
+ *
+ * `activeOnly` ochiq o'qishda `true`: o'chirilgan havola ilovada
+ * ko'rinmasligi kerak, admin esa uni ro'yxatda ko'rib qayta yoqa olishi
+ * kerak.
+ */
+async function readAppContent(activeOnly: boolean) {
+  const [content, links] = await Promise.all([
+    db.query('SELECT * FROM app_content WHERE key=$1::text', [APP_CONTENT_KEY]),
+    db.query(
+      `SELECT * FROM app_content_links
+        WHERE content_key=$1::text ${activeOnly ? 'AND is_active = true' : ''}
+        ORDER BY sort_order, created_at`,
+      [APP_CONTENT_KEY],
+    ),
+  ]);
+  const row = content.rows[0];
+  return {
+    title: String(row?.title ?? FALLBACK_APP_CONTENT.title),
+    body: String(row?.body ?? FALLBACK_APP_CONTENT.body),
+    links: links.rows.map(mapContentLink),
+    updatedAt: iso(row?.updated_at),
+  };
+}
+
+/**
+ * Ochiq: ilova bu matnni «Biz haqimizda» ekranida chizadi.
+ *
+ * Token talab qilinmaydi — mehmon ham shu sahifani ko'radi va kirish
+ * ekranidagi qisqa intro ham shu manbadan oziqlanadi.
+ */
+app.get('/v3/app/content', async () => ({ content: await readAppContent(true) }));
+
+app.get('/v3/admin/app-content', async (request, reply) => {
+  if (!(await requirePermission(request, reply, 'content:read'))) return;
+  return { content: await readAppContent(false) };
+});
+
+/**
+ * Matn va havolalarni to'liq almashtiradi.
+ *
+ * `links` berilganda ro'yxat aynan yuborilgan holatga keltiriladi:
+ * yo'q havola o'chiriladi. Bu «hato ma'lumotni o'chirish» talabini
+ * alohida endpointsiz bajaradi va admin ekranida bitta «saqlash»
+ * tugmasi qolishiga imkon beradi.
+ */
+app.put('/v3/admin/app-content', async (request, reply) => {
+  const claims = await requirePermission(request, reply, 'content:write'); if (!claims) return;
+  const reason = asString(asObject(request.body).changeReason);
+  if (!reason) return apiError(reply, 422, 'validation_failed', 'O‘zgarish sababi majburiy.', { changeReason: ['Sababni yozing.'] });
+
+  let update: ReturnType<typeof parseAppContentUpdate>;
+  try {
+    update = parseAppContentUpdate(request.body);
+  } catch (error) {
+    if (error instanceof AppContentValidationError) {
+      return apiError(reply, 422, 'validation_failed', error.message, { [error.field]: [error.message] });
+    }
+    throw error;
+  }
+
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    // Parametr turlari nozik — izohi `sql.ts` da.
+    await client.query(UPSERT_APP_CONTENT, [
+      APP_CONTENT_KEY, update.title ?? null, update.body ?? null,
+      FALLBACK_APP_CONTENT.title, FALLBACK_APP_CONTENT.body, claims.sub,
+    ]);
+
+    if (update.links) {
+      const keptIds = update.links.map((link) => link.id).filter((id): id is string => Boolean(id));
+      await client.query(DELETE_MISSING_CONTENT_LINKS, [APP_CONTENT_KEY, keptIds]);
+      for (const [index, link] of update.links.entries()) {
+        const sortOrder = link.sortOrder || index;
+        if (link.id) {
+          const updated = await client.query(UPDATE_APP_CONTENT_LINK, [
+            link.id, APP_CONTENT_KEY, link.kind, link.label, link.value, link.url, sortOrder, link.isActive,
+          ]);
+          if (updated.rowCount) continue;
+          // Boshqa moderator o'chirib yuborgan bo'lsa yozuv qayta
+          // yaratiladi: saqlash tugmasi jimgina ma'lumot yo'qotmasin.
+        }
+        await client.query(INSERT_APP_CONTENT_LINK, [
+          APP_CONTENT_KEY, link.kind, link.label, link.value, link.url, sortOrder, link.isActive,
+        ]);
+      }
+    }
+
+    const auditLogId = await audit(
+      claims,
+      'content.update',
+      'app_content',
+      APP_CONTENT_KEY,
+      reason,
+      { title: update.title ?? null, bodyLength: update.body?.length ?? null, linkCount: update.links?.length ?? null },
+      request,
+      client,
+    );
+    await client.query('COMMIT');
+    return { content: await readAppContent(false), auditLogId };
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    return failFromError(reply, error, 'app_content.update');
+  } finally {
+    client.release();
+  }
 });
 
 app.get('/v3/admin/integrations', async (request, reply) => {

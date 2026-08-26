@@ -60,13 +60,19 @@ export interface AudioRef {
   mimeType: string;
 }
 
-/** GET /words (public) va GET /admin/words (admin) — bir xil filtr. */
+/**
+ * GET /words — ochiq lug'at va admin ro'yxati bir xil endpoint.
+ *
+ * `status` (shu jumladan `all`) faqat autentifikatsiya qilingan va
+ * `words:read` ruxsatiga ega so'rovda hisobga olinadi. Tokensiz so'rov
+ * har doim faqat nashr etilgan so'zlarni oladi.
+ */
 export interface WordListQuery extends PageQuery {
   search?: string;
   regionId?: Uuid;
   dialectId?: Uuid;
   category?: string;
-  status?: WordStatus;
+  status?: WordStatus | 'all';
   hasAudio?: boolean;
   sort?: 'recent' | 'alphabetical' | 'popular';
 }

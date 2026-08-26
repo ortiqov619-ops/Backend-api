@@ -87,6 +87,38 @@ export function parseRegionSuggestion(
   return { nameUz, level: rawLevel as ProposedRegionLevel, parentRegionId };
 }
 
+/**
+ * Foydalanuvchi kiritadigan erkin matnli hudud maydonlari — mahalla nomi
+ * va urug'/laqab.
+ *
+ * Ular `regions` katalogiga bog'lanmaydi va so'z bilan birga payloadda
+ * saqlanadi, shuning uchun uzunlik va belgi to'plami aynan hudud nomi
+ * bilan bir xil qat'iylikda tekshiriladi: havola, teg yoki uzun matn
+ * moderator ekraniga tushmasligi kerak.
+ *
+ * Bo'sh qiymat xato emas — bu maydonlar ixtiyoriy.
+ */
+export function parseLocalIdentifier(
+  input: unknown,
+  field: string,
+  options: { maxLength?: number } = {},
+): string | null {
+  if (input == null) return null;
+  if (typeof input !== 'string') {
+    throw new RegionSuggestionValidationError('Qiymat matn bo‘lishi kerak.', field);
+  }
+  const value = input.normalize('NFKC').replace(/\s+/g, ' ').trim();
+  if (!value) return null;
+  const maxLength = options.maxLength ?? 80;
+  if (value.length < 2 || value.length > maxLength) {
+    throw new RegionSuggestionValidationError(`Qiymat 2–${maxLength} ta belgidan iborat bo‘lishi kerak.`, field);
+  }
+  if (!SAFE_REGION_NAME.test(value) || /https?:|www\.|@/iu.test(value)) {
+    throw new RegionSuggestionValidationError('Qiymatda ruxsat etilmagan belgi bor.', field);
+  }
+  return value;
+}
+
 export function canBeChildOf(child: ProposedRegionLevel, parent: string): boolean {
   return canCreateRegionUnder(child, parent);
 }

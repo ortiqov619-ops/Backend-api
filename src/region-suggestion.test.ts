@@ -6,6 +6,7 @@ import {
   isDirectVillageChild,
   normalizeDialectLabel,
   normalizeRegionName,
+  parseLocalIdentifier,
   parseRegionSuggestion,
   resolveRegionForPublication,
   uniqueDialectIdByLabel,
@@ -86,4 +87,45 @@ test('unresolved village is safely generalized to the moderator-selected distric
     matchedRegionId: null,
     resolution: 'generalized',
   });
+});
+
+// ---------------------------------------------------------------------------
+// Erkin matnli hudud maydonlari: mahalla nomi va urug'/laqab
+// ---------------------------------------------------------------------------
+
+test('mahalla va urug‘ nomi tozalanib qaytadi', () => {
+  assert.equal(parseLocalIdentifier('  Shomaxulum   mahallasi ', 'payload.neighborhood'), 'Shomaxulum mahallasi');
+  assert.equal(parseLocalIdentifier("Qo‘ng‘irot", 'payload.clan', { maxLength: 60 }), "Qo‘ng‘irot");
+});
+
+test('bo‘sh qiymat xato emas — bu maydonlar ixtiyoriy', () => {
+  assert.equal(parseLocalIdentifier('', 'payload.clan'), null);
+  assert.equal(parseLocalIdentifier('   ', 'payload.clan'), null);
+  assert.equal(parseLocalIdentifier(null, 'payload.clan'), null);
+  assert.equal(parseLocalIdentifier(undefined, 'payload.clan'), null);
+});
+
+test('havola, teg va uzun matn moderator ekraniga tushmaydi', () => {
+  for (const value of ['https://example.com', 'www.spam.uz', '<script>alert(1)</script>', 'yoz@menga', 'x'.repeat(81)]) {
+    assert.throws(
+      () => parseLocalIdentifier(value, 'payload.neighborhood'),
+      RegionSuggestionValidationError,
+      value,
+    );
+  }
+});
+
+test('juda qisqa qiymat va matn bo‘lmagan tur rad etiladi', () => {
+  assert.throws(() => parseLocalIdentifier('x', 'payload.clan'), RegionSuggestionValidationError);
+  assert.throws(() => parseLocalIdentifier(42, 'payload.clan'), RegionSuggestionValidationError);
+  assert.throws(() => parseLocalIdentifier({ nameUz: 'x' }, 'payload.clan'), RegionSuggestionValidationError);
+});
+
+test('maxLength maydonga qarab o‘zgaradi', () => {
+  const sixtyOne = 'a'.repeat(61);
+  assert.equal(parseLocalIdentifier(sixtyOne, 'payload.neighborhood'), sixtyOne);
+  assert.throws(
+    () => parseLocalIdentifier(sixtyOne, 'payload.clan', { maxLength: 60 }),
+    (error: unknown) => error instanceof RegionSuggestionValidationError && error.field === 'payload.clan',
+  );
 });

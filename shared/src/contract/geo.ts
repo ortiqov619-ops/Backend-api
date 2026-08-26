@@ -102,14 +102,43 @@ export const DEFAULT_GEOFENCE_POLICY: GeofencePolicy = {
   blockOnMockLocation: true,
 };
 
+/**
+ * Hudud daraja ierarxiyasi:
+ * `republic` — respublika/davlat (O‘zbekiston, Turkmaniston, Qoraqalpog‘iston, Afg‘oniston);
+ * `region` — viloyat;
+ * `district` — shahar/tuman;
+ * `village` — qishloq / oba / ovul / jamoa xo‘jaligi;
+ * `neighborhood` — mahalla.
+ *
+ * Urug‘/laqab va lahja alohida daraja emas: ular so‘zning o‘z maydonlari
+ * (`Word.clan`, `Word.dialectId`), chunki bitta qishloqda bir nechta
+ * urug‘ va lahja yonma-yon yashaydi.
+ */
+export type RegionLevel = 'republic' | 'region' | 'district' | 'village' | 'neighborhood';
+
+export const REGION_LEVELS: readonly RegionLevel[] = ['republic', 'region', 'district', 'village', 'neighborhood'] as const;
+
+export const REGION_LEVEL_LABELS: Record<RegionLevel, string> = {
+  republic: 'Respublika / davlat',
+  region: 'Viloyat',
+  district: 'Shahar / tuman',
+  village: 'Qishloq / oba / ovul / jamoa xo‘jaligi',
+  neighborhood: 'Mahalla',
+};
+
 export interface Region extends Auditable {
   id: Uuid;
   /** `xorazm`, `xiva`, `urganch` ... */
   code: string;
   nameUz: string;
   nameOz?: string | null;
+  /**
+   * Hududning eski (tarixiy) nomi — «jamoa xo‘jaligi» davridagi nom ham
+   * shu yerda saqlanadi. Faqat ma’lumot: qidiruv va FK bunga tayanmaydi.
+   */
+  formerName?: string | null;
   parentId?: Uuid | null;
-  level: 'republic' | 'region' | 'district' | 'village' | 'neighborhood';
+  level: RegionLevel;
   isContributionAllowed: boolean;
   /** Statistika uchun; API to'ldiradi. */
   wordCount?: number;
@@ -143,7 +172,7 @@ export interface Dialect extends Auditable {
 /** GET /regions */
 export interface RegionListQuery {
   parentId?: Uuid;
-  level?: Region['level'];
+  level?: RegionLevel;
   includeGeofences?: boolean;
 }
 
@@ -174,8 +203,11 @@ export interface UpdateGeofenceResponse {
 export interface CreateRegionRequest {
   code: string;
   nameUz: string;
-  level?: Exclude<Region['level'], 'republic'>;
+  /** Berilmasa `region` deb qabul qilinadi (avvalgi xulq). */
+  level?: RegionLevel;
+  /** `republic` uchun bo‘sh; qolgan darajalarda majburiy. */
   parentId?: Uuid | null;
+  formerName?: string | null;
   changeReason: string;
 }
 
