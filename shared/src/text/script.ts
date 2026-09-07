@@ -100,7 +100,11 @@ export function hasCyrillic(value: string): boolean {
  */
 export function toCyrillicScript(value: string): string {
   if (!value) return value;
-  const normalized = value.normalize('NFKC').replace(APOSTROPHES, "'");
+  // NFC, NFKC EMAS. NFKC moslik belgilarini parchalaydi va ko'rsatish
+  // matnini jimgina o'zgartiradi: «…» uchta nuqtaga, «№» esa «No» ga
+  // aylanardi. Apostroflar quyida alohida normallashtiriladi, shuning
+  // uchun NFKC ning agressivligi bu yerda kerak emas.
+  const normalized = value.normalize('NFC').replace(APOSTROPHES, "'");
   let result = '';
   let index = 0;
   outer: while (index < normalized.length) {
@@ -121,7 +125,8 @@ export function toCyrillicScript(value: string): string {
 export function toLatinScript(value: string): string {
   if (!value) return value;
   let result = '';
-  for (const character of value.normalize('NFKC')) {
+  // NFC — sabab `toCyrillicScript` dagi bilan bir xil.
+  for (const character of value.normalize('NFC')) {
     const mapped = CYRILLIC_TO_LATIN[character];
     result += mapped === undefined ? character : mapped;
   }
@@ -147,6 +152,8 @@ export function applyDisplayScript(value: string, script: DisplayScript): string
  * keltirilib, apostrof va registr olib tashlanadi.
  */
 export function foldScript(value: string): string {
+  // Bu yerda NFKC ATAYLAB: qidiruvda «…» va «...» bir xil hisoblanishi
+  // kerak. Bu ko'rsatish emas — natija faqat solishtirish uchun.
   return toLatinScript(value)
     .normalize('NFKC')
     .replace(APOSTROPHES, '')

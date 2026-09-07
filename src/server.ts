@@ -64,6 +64,9 @@ import {
 } from './pattern-auth';
 import {
   DELETE_MISSING_CONTENT_LINKS,
+  REGION_STATS_SQL,
+  WORD_AUDIO_MATCH_SQL,
+  WORD_HAS_AUDIO_SQL,
   INSERT_APP_CONTENT_LINK,
   INSERT_VALIDATION_RESULT,
   jsonb,
@@ -85,6 +88,7 @@ import {
 import { parseServiceAccount, sendUpdateToTopic } from './fcm';
 import { AppContentValidationError, parseAppContentUpdate } from './app-content';
 import { submitterDisplayName } from './guest-identity';
+import { blockedMessage, decideContributionAccess } from './contribution-access';
 import { buildWordListFilters, WordFilterValidationError } from './word-filters';
 import { appFeaturesFrom, SUPPORTED_INTEGRATIONS } from './feature-gate';
 
@@ -230,7 +234,17 @@ async function audit(actor: Claims | null, action: string, entityType: string, e
 }
 
 function mapRegion(row: QueryResultRow) {
-  return { id: row.id, code: row.code, nameUz: row.name_uz, nameOz: row.name_oz, formerName: row.former_name ?? null, parentId: row.parent_id, level: row.level, isContributionAllowed: row.is_contribution_allowed, createdAt: iso(row.created_at), updatedAt: iso(row.updated_at) };
+  const base = { id: row.id, code: row.code, nameUz: row.name_uz, nameOz: row.name_oz, formerName: row.former_name ?? null, parentId: row.parent_id, level: row.level, isContributionAllowed: row.is_contribution_allowed, createdAt: iso(row.created_at), updatedAt: iso(row.updated_at) };
+  // Statistika faqat `includeStats=true` bo'lganda so'ralgan bo'ladi.
+  // `undefined` va `0` ni farqlash muhim: nol — haqiqiy javob, yo'qlik
+  // esa "so'ralmagan" degani va ekran uni ko'rsatmasligi kerak.
+  if (row.word_count === undefined) return base;
+  return {
+    ...base,
+    wordCount: Number(row.word_count ?? 0),
+    audioCount: Number(row.audio_count ?? 0),
+    dominantDialectId: row.dominant_dialect_id ?? null,
+  };
 }
 function mapFence(row: QueryResultRow) {
   return { id: row.id, regionId: row.region_id, name: row.name, area: row.area_geojson, policy: row.policy, isActive: row.is_active, version: row.version, note: row.note, createdAt: requiredIso(row.created_at), updatedAt: requiredIso(row.updated_at) };
@@ -251,12 +265,8 @@ function mapWord(row: QueryResultRow) {
  * yuboradi va so'z keyin tasdiqdan chiqadi. Faqat birinchi shart
  * tekshirilganda lug'atdagi audiolarning ko'pchiligi ko'rinmay qolardi.
  */
-const WORD_AUDIO_MATCH_SQL = `au.superseded_at IS NULL
-  AND au.moderation_status = 'approved'
-  AND au.storage_available
-  AND (au.word_id = w.id OR au.contribution_request_id = w.source_request_id)`;
-
-const WORD_HAS_AUDIO_SQL = `EXISTS (SELECT 1 FROM audio_submissions au WHERE ${WORD_AUDIO_MATCH_SQL})`;
+// Lug'at/hudud SQL matnlari `sql.ts` da — u yerda ular haqiqiy
+// PostgreSQL parseriga qarshi test qilinadi.
 
 /**
  * Yozuvni "saqlashda yo'q" deb belgilaydi.
@@ -878,8 +888,11 @@ function mapModeratorProfile(row: QueryResultRow) {
  *
  * Hissa qo'shish hisobsiz ham mumkin bo'lib qolishi kerak — bu ataylab
  * qo'yilgan past to'siq. Hisob bo'lsa, taklif unga bog'lanadi va
- * foydalanuvchi qaror haqida xabar oladi; bo'lmasa avvalgidek anonim
- * ketadi. Bloklangan hisob esa hech qanday holatda yozuv qoldirmaydi.
+ * foydalanuvchi qaror haqida xabar oladi; bo'lmasa anonim ketadi.
+ *
+ * Bloklangan hisob bu yerda `null` qaytadi — ya'ni "hisob yo'q" va
+ * "bloklangan" farqlanmaydi. Farqni `contribution-access.ts` hal
+ * qiladi; u yerda bloklashning aniq chegarasi ham yozilgan.
  */
 async function optionalAppUser(request: FastifyRequest): Promise<QueryResultRow | null> {
   const authorization = request.headers.authorization;
@@ -894,26 +907,37 @@ async function optionalAppUser(request: FastifyRequest): Promise<QueryResultRow 
   }
 }
 
-/**
- * Tokenga tegishli hisob bloklanganmi.
- *
- * `optionalAppUser` bloklangan hisob uchun ham `null` qaytaradi, ya'ni
- * "hisob yo'q" va "hisob bloklangan" farqlanmaydi. Hissa qo'shish
- * hisobsiz ham ochiq bo'lgani uchun bu farq muhim: aks holda
- * bloklangan odam o'z tokeni bilan mehmon sifatida yozishda davom
- * etardi va bloklash ma'nosini yo'qotardi.
- */
-async function blockedAppUserFor(request: FastifyRequest): Promise<QueryResultRow | null> {
+/** Tokenga tegishli hisob bloklanganmi. */
+async function blockedAppUserByToken(request: FastifyRequest): Promise<{ blockedReason: string | null } | null> {
   const authorization = request.headers.authorization;
   if (!authorization?.startsWith('Bearer ')) return null;
   try {
     const { sub } = await verifyAppUserToken(authorization.slice(7));
-    const found = await db.query(`SELECT id, blocked_at, blocked_reason FROM users WHERE id=$1::uuid AND kind='app'`, [sub]);
+    const found = await db.query(`SELECT blocked_at, blocked_reason FROM users WHERE id=$1::uuid AND kind='app'`, [sub]);
     const user = found.rows[0];
-    return user?.blocked_at ? user : null;
+    return user?.blocked_at ? { blockedReason: nullableString(user.blocked_reason) } : null;
   } catch {
     return null;
   }
+}
+
+/**
+ * Shu qurilmaga bog'langan bloklangan hisob.
+ *
+ * Hisobdan chiqish bloklashni bekor qilmasligi kerak. Chegarasi
+ * `contribution-access.ts` da ochiq yozilgan: qayta o'rnatish yangi
+ * `installationId` beradi va bu tekshiruvdan o'tadi.
+ */
+async function blockedAppUserByDevice(installationId: string): Promise<{ blockedReason: string | null } | null> {
+  if (!installationId) return null;
+  const found = await db.query(
+    `SELECT blocked_reason FROM users
+      WHERE kind='app' AND blocked_at IS NOT NULL AND installation_id = $1
+      ORDER BY blocked_at DESC LIMIT 1`,
+    [installationId],
+  );
+  const user = found.rows[0];
+  return user ? { blockedReason: nullableString(user.blocked_reason) } : null;
 }
 
 function mapNotification(row: QueryResultRow) {
@@ -1798,7 +1822,12 @@ app.get('/v3/regions', async (request) => {
   const query = request.query as Json; const params: unknown[] = []; const filters: string[] = [];
   if (query.parentId) { params.push(query.parentId); filters.push(`parent_id = $${params.length}`); }
   if (query.level) { params.push(query.level); filters.push(`level = $${params.length}`); }
-  const regions = await db.query(`SELECT * FROM regions ${filters.length ? `WHERE ${filters.join(' AND ')}` : ''} ORDER BY sort_order, name_uz`, params);
+  // Statistika ixtiyoriy va OCHIQ: faqat nashr etilgan so'z va
+  // tasdiqlangan audio hisoblanadi. `v_region_stats` bu yerda
+  // ishlatilmaydi — u moderatsiya navbatini ham qaytaradi va uni
+  // tokensiz so'rovga berish mumkin emas.
+  const statsSelect = bool(query.includeStats) ? `, ${REGION_STATS_SQL}` : '';
+  const regions = await db.query(`SELECT r.*${statsSelect} FROM regions r ${filters.length ? `WHERE ${filters.join(' AND ').replace(/\b(parent_id|level)\b/g, 'r.$1')}` : ''} ORDER BY r.sort_order, r.name_uz`, params);
   const response: Json = { items: regions.rows.map(mapRegion) };
   if (bool(query.includeGeofences)) {
     const [fences, dialects] = await Promise.all([db.query('SELECT * FROM geofences WHERE is_active=true'), db.query(`SELECT d.*, COALESCE(array_agg(dr.region_id) FILTER (WHERE dr.region_id IS NOT NULL), '{}') AS region_ids FROM dialects d LEFT JOIN dialect_regions dr ON dr.dialect_id=d.id GROUP BY d.id`)]);
@@ -1956,16 +1985,17 @@ app.post('/v3/contributions/words', async (request, reply) => {
    * `optionalAppUser` dan `null` qaytadi — bunday odam mehmon sifatida
    * ham yoza olmasligi uchun quyida alohida tekshiriladi.
    */
-  const submitter = await optionalAppUser(request);
-  if (!submitter && request.headers.authorization?.startsWith('Bearer ')) {
-    // Token bor, lekin hisob yo'q/bloklangan: buni jimgina mehmonga
-    // aylantirish bloklashni chetlab o'tish yo'li bo'lardi.
-    const blocked = await blockedAppUserFor(request);
-    if (blocked) {
-      return apiError(reply, 403, 'account_blocked', `Hisobingiz bloklangan. Sabab: ${blocked.blocked_reason ?? 'ko‘rsatilmagan'}`);
-    }
-  }
   const submitterInstallationId = asString(device.installationId);
+  const submitter = await optionalAppUser(request);
+  const access = decideContributionAccess({
+    hasBearerToken: Boolean(request.headers.authorization?.startsWith('Bearer ')),
+    activeAccount: submitter ? { id: String(submitter.id) } : null,
+    blockedAccountByToken: submitter ? null : await blockedAppUserByToken(request),
+    blockedAccountByDevice: submitter ? null : await blockedAppUserByDevice(submitterInstallationId),
+  });
+  if (access.kind === 'blocked') {
+    return apiError(reply, 403, 'account_blocked', blockedMessage(access.reason));
+  }
   const geofences = await activeFences(); const heritageDeclaration = bool(body.heritageDeclaration);
   const hasLocation = Number.isFinite(Number(location.latitude)) && Number.isFinite(Number(location.longitude));
   const gate = hasLocation ? practicalMobileGate(location, geofences) : null;

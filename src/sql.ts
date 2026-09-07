@@ -103,3 +103,41 @@ export const UPDATE_APP_CONTENT_LINK = `UPDATE app_content_links
 export const INSERT_APP_CONTENT_LINK = `INSERT INTO app_content_links
     (content_key, kind, label, value, url, sort_order, is_active)
   VALUES ($1::text,$2::app_content_link_kind,$3::text,$4::text,$5::text,$6::integer,$7::boolean)`;
+
+/* ------------------------- lug'at va hudud ------------------------- */
+
+/**
+ * So'zga tegishli tasdiqlangan talaffuz sharti.
+ *
+ * Audio ikki yo'l bilan bog'lanadi: to'g'ridan-to'g'ri lug'at so'ziga
+ * (`word_id`) yoki shu so'z chiqqan taklifga
+ * (`contribution_request_id`). Ikkinchisi odatiy holat.
+ */
+export const WORD_AUDIO_MATCH_SQL = `au.superseded_at IS NULL
+  AND au.moderation_status = 'approved'
+  AND au.storage_available
+  AND (au.word_id = w.id OR au.contribution_request_id = w.source_request_id)`;
+
+export const WORD_HAS_AUDIO_SQL = `EXISTS (SELECT 1 FROM audio_submissions au WHERE ${WORD_AUDIO_MATCH_SQL})`;
+
+/** So'z shu hududga tegishlimi — ierarxiyaning uch pog'onasi. */
+export const REGION_MATCH_SQL = `(w.region_id = r.id OR w.district_id = r.id OR w.village_id = r.id)`;
+
+/**
+ * Atlas uchun OCHIQ hudud statistikasi.
+ *
+ * `v_region_stats` bu yerda ishlatilmaydi: u `pending_count` ni ham
+ * qaytaradi, ya'ni moderatsiya navbatini — uni tokensiz so'rovga berish
+ * mumkin emas. Bu yerda faqat nashr etilgan so'z va tasdiqlangan audio
+ * sanaladi, shuning uchun Atlasdagi son lug'atdagi bilan bir xil bo'ladi.
+ *
+ * Tashqi so'rovda `regions` jadvali `r` deb nomlanishi SHART.
+ */
+export const REGION_STATS_SQL = `
+  (SELECT count(*)::int FROM words w WHERE w.status = 'published' AND ${REGION_MATCH_SQL}) AS word_count,
+  (SELECT count(*)::int FROM words w
+     WHERE w.status = 'published' AND ${REGION_MATCH_SQL}
+       AND ${WORD_HAS_AUDIO_SQL}) AS audio_count,
+  (SELECT w.dialect_id FROM words w
+     WHERE w.status = 'published' AND ${REGION_MATCH_SQL} AND w.dialect_id IS NOT NULL
+     GROUP BY w.dialect_id ORDER BY count(*) DESC, w.dialect_id LIMIT 1) AS dominant_dialect_id`;

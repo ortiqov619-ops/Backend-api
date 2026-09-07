@@ -84,3 +84,68 @@ test('hasCyrillic va isDisplayScript', () => {
   assert.equal(isDisplayScript('arabic'), false);
   assert.equal(isDisplayScript(null), false);
 });
+
+// ---------------------------------------------------------------------------
+// Qamrov: ilovada haqiqatan ishlatiladigan matnlar
+// ---------------------------------------------------------------------------
+
+/** IntroScreen, UpdateGate, PronunciationRecorder va alertlardan olingan. */
+const APP_STRINGS = [
+  'XORAZMNING OVOZI',
+  'TIRIK LUG‘AT',
+  'Lug‘atni ochish',
+  'Lug‘at ochilmoqda…',
+  'Ilovani yangilash kerak',
+  'YANGI VERSIYADA',
+  'Yangilanish tavsiya qilinadi',
+  'O‘rnatishga ruxsat kerak',
+  'Android oynasida «O‘rnatish»ni tasdiqlang.',
+  'Mikrofonga ruxsat yo‘q',
+  'Yozuv juda qisqa — so‘zni to‘liq talaffuz qiling.',
+  'Audio avtomatik tahlildan o‘tadi, lekin yakuniy qarorni moderator qabul qiladi.',
+  'Qishloq / oba / ovul / jamoa xo‘jaligi',
+  'Urug‘ / laqab (ixtiyoriy)',
+  'Hisobdan chiqasizmi?',
+  'Bizning telegram kanal',
+  'Shevalar atlasi',
+  'Hali statistika yo‘q',
+];
+
+test('ilovadagi barcha matnlar kirilchaga to‘liq o‘giriladi', () => {
+  for (const text of APP_STRINGS) {
+    const cyrillic = toCyrillicScript(text);
+    // Lotin harfi qolib ketmasligi kerak — qolsa u o'girilmagan degani.
+    assert.ok(!/[a-zA-Z]/.test(cyrillic), `o‘girilmagan harf qoldi: ${text} → ${cyrillic}`);
+    // Uzunlik nolga tushmasligi va matn yo'qolmasligi kerak.
+    assert.ok(cyrillic.length > 0, text);
+  }
+});
+
+test('tinish belgilari va qavslar o‘girishda saqlanadi', () => {
+  for (const text of APP_STRINGS) {
+    const cyrillic = toCyrillicScript(text);
+    for (const mark of ['«', '»', '(', ')', '/', '…', '—', '?', '.', ',']) {
+      assert.equal(
+        cyrillic.split(mark).length, text.split(mark).length,
+        `«${mark}» belgisi yo‘qoldi yoki ko‘paydi: ${text}`,
+      );
+    }
+  }
+});
+
+test('applyDisplayScript hech qachon bo‘sh natija bermaydi', () => {
+  for (const text of APP_STRINGS) {
+    for (const script of ['latin', 'cyrillic'] as const) {
+      assert.ok(applyDisplayScript(text, script).trim().length > 0, `${script}: ${text}`);
+    }
+  }
+});
+
+test('qidiruv kaliti ilovadagi matnlar uchun ikkala yozuvda mos', () => {
+  for (const text of APP_STRINGS) {
+    assert.equal(
+      foldScript(text), foldScript(toCyrillicScript(text)),
+      `qidiruv kaliti ajralib ketdi: ${text}`,
+    );
+  }
+});

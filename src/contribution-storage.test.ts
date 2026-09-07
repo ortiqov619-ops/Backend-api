@@ -6,6 +6,7 @@ import { submitterDisplayName, GUEST_DISPLAY_PATTERN } from './guest-identity';
 import { buildWordListFilters } from './word-filters';
 import {
   DELETE_MISSING_CONTENT_LINKS,
+  REGION_STATS_SQL,
   INSERT_APP_CONTENT_LINK,
   UPDATE_APP_CONTENT_LINK,
   UPSERT_APP_CONTENT,
@@ -303,5 +304,79 @@ test('ro‘yxatda qolgan havola o‘chirilmaydi', needsDatabase, async () => {
       `SELECT id FROM app_content_links WHERE content_key='about'`,
     )).rows.map((row) => row.id);
     assert.deepEqual(left, [ids[0]]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 4. Atlas uchun ochiq hudud statistikasi
+// ---------------------------------------------------------------------------
+
+test('hudud statistikasi SQL i PostgreSQL da bajariladi', needsDatabase, async () => {
+  await inRollback(async (client) => {
+    // Korrelatsiyalangan pastki so'rovlar tashqi `r` aliasiga tayanadi —
+    // buni faqat haqiqiy parser tekshira oladi.
+    const rows = await client.query(
+      `SELECT r.id, r.name_uz, ${REGION_STATS_SQL} FROM regions r ORDER BY r.sort_order LIMIT 5`,
+    );
+    assert.ok(rows.rows.length > 0, 'katalog bo‘sh bo‘lmasligi kerak');
+    for (const row of rows.rows) {
+      assert.equal(typeof Number(row.word_count), 'number');
+      assert.ok(Number(row.word_count) >= 0);
+      assert.ok(Number(row.audio_count) >= 0);
+      assert.ok(Number(row.audio_count) <= Number(row.word_count), 'audio soni so‘z sonidan oshmasligi kerak');
+    }
+  });
+});
+
+test('statistika faqat nashr etilgan so‘zni sanaydi', needsDatabase, async () => {
+  await inRollback(async (client) => {
+    const xorazm = '00000000-0000-4000-8000-000000000001';
+    const before = (await client.query<{ word_count: number }>(
+      `SELECT ${REGION_STATS_SQL} FROM regions r WHERE r.id = $1`, [xorazm],
+    )).rows[0]!.word_count;
+
+    const draft = unique('qoralama').replace(/-/g, '');
+    await client.query(
+      `INSERT INTO words (word, meaning, phonetic_key, status, region_id) VALUES ($1,'test',$1,'draft',$2)`,
+      [draft, xorazm],
+    );
+    const afterDraft = (await client.query<{ word_count: number }>(
+      `SELECT ${REGION_STATS_SQL} FROM regions r WHERE r.id = $1`, [xorazm],
+    )).rows[0]!.word_count;
+    assert.equal(Number(afterDraft), Number(before), 'qoralama ochiq statistikaga tushmasligi kerak');
+
+    const published = unique('nashr').replace(/-/g, '');
+    await client.query(
+      `INSERT INTO words (word, meaning, phonetic_key, status, region_id) VALUES ($1,'test',$1,'published',$2)`,
+      [published, xorazm],
+    );
+    const afterPublished = (await client.query<{ word_count: number }>(
+      `SELECT ${REGION_STATS_SQL} FROM regions r WHERE r.id = $1`, [xorazm],
+    )).rows[0]!.word_count;
+    assert.equal(Number(afterPublished), Number(before) + 1, 'nashr etilgan so‘z sanalishi kerak');
+  });
+});
+
+test('tuman va qishloqdagi so‘z viloyat sanog‘iga ham kiradi', needsDatabase, async () => {
+  await inRollback(async (client) => {
+    const xorazm = '00000000-0000-4000-8000-000000000001';
+    const district = (await client.query<{ id: string }>(
+      `SELECT id FROM regions WHERE parent_id = $1 AND level = 'district' LIMIT 1`, [xorazm],
+    )).rows[0];
+    if (!district) return; // katalog bo'sh bo'lsa tekshiradigan narsa yo'q
+
+    const before = (await client.query<{ word_count: number }>(
+      `SELECT ${REGION_STATS_SQL} FROM regions r WHERE r.id = $1`, [xorazm],
+    )).rows[0]!.word_count;
+
+    const word = unique('tuman').replace(/-/g, '');
+    await client.query(
+      `INSERT INTO words (word, meaning, phonetic_key, status, district_id) VALUES ($1,'test',$1,'published',$2)`,
+      [word, district.id],
+    );
+    const after = (await client.query<{ word_count: number }>(
+      `SELECT ${REGION_STATS_SQL} FROM regions r WHERE r.id = $1`, [xorazm],
+    )).rows[0]!.word_count;
+    assert.equal(Number(after), Number(before) + 1, 'tumandagi so‘z viloyatda ham ko‘rinishi kerak');
   });
 });

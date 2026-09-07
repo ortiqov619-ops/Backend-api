@@ -174,6 +174,19 @@ export interface RegionListQuery {
   parentId?: Uuid;
   level?: RegionLevel;
   includeGeofences?: boolean;
+  /**
+   * `wordCount`, `audioCount` va `dominantDialectId` ni ham qaytaradi.
+   *
+   * Ixtiyoriy, chunki agregat har bir hudud uchun `words` va
+   * `audio_submissions` bo'ylab hisoblanadi — hissa formasi kabi tez-tez
+   * chaqiriladigan joylarda bu keraksiz yuk bo'lardi. Atlas ekrani uni
+   * ataylab so'raydi.
+   *
+   * Qaytadigan son OCHIQ ma'lumot: faqat nashr etilgan so'zlar va
+   * tasdiqlangan, saqlashda mavjud audio hisoblanadi. Moderatsiya
+   * navbati bu yerda hech qachon ko'rinmaydi.
+   */
+  includeStats?: boolean;
 }
 
 export interface RegionListResponse {

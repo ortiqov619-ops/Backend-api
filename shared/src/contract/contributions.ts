@@ -119,8 +119,19 @@ export interface CreateWordContributionRequest {
   payload: ContributionPayload;
   /** GPS namunasi mavjud bo'lsa yuboriladi. Safardagi Xorazmlik uchun bo'sh bo'lishi mumkin. */
   location?: LocationSample | null;
-  /** Foydalanuvchining Xorazm bilan doimiy aloqasi haqidagi deklaratsiyasi.
-   * Bunday hissa doimo moderator tekshiruviga tushadi. */
+  /**
+   * Foydalanuvchining Xorazm bilan doimiy aloqasi haqidagi ANIQ
+   * deklaratsiyasi.
+   *
+   * Faqat foydalanuvchi buni ochiq tanlaganda yuboriladi. Mijoz uni
+   * o'z ixtiyori bilan `true` qilib qo'ymasligi kerak.
+   *
+   * Server buni FAQAT audit metama'lumoti sifatida `device` ustuniga
+   * yozadi: u hech qanday tekshiruvni yoqmaydi va o'chirmaydi. Barcha
+   * takliflar baribir moderator ko'rigiga tushadi
+   * (`requires_human_review` har doim `true`), shuning uchun bu maydon
+   * moderatsiya yo'nalishiga ta'sir qilmaydi.
+   */
   heritageDeclaration?: boolean;
   device: DeviceContext;
   /** Client tomonda hisoblangan dastlabki filtr — server qayta hisoblaydi. */
@@ -148,6 +159,12 @@ export interface CreateAudioContributionMeta {
   durationMs: number;
   mimeType: string;
   location?: LocationSample | null;
+  /**
+   * Foydalanuvchining aniq deklaratsiyasi — audit uchun.
+   *
+   * Audio qabul qilinishi bunga bog'liq EMAS: egalik `installationId`
+   * bo'yicha tekshiriladi va joylashuv talab qilinmaydi.
+   */
   heritageDeclaration?: boolean;
   device: DeviceContext;
   idempotencyKey: string;
