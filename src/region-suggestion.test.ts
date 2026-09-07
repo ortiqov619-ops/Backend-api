@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   canBeChildOf,
   canCreateRegionUnder,
+  isDirectNeighborhoodChild,
   isDirectVillageChild,
   normalizeDialectLabel,
   normalizeRegionName,
@@ -53,6 +54,13 @@ test('canonical village must be the direct child of the selected district', () =
   assert.equal(isDirectVillageChild({ level: 'village', parentId: districtId }, null), false);
 });
 
+test('canonical neighborhood must be the direct child of its selected parent', () => {
+  const parentId = '10000000-0000-4000-8000-000000000002';
+  assert.equal(isDirectNeighborhoodChild({ level: 'neighborhood', parentId }, parentId), true);
+  assert.equal(isDirectNeighborhoodChild({ level: 'neighborhood', parentId: XORAZM_ID }, parentId), false);
+  assert.equal(isDirectNeighborhoodChild({ level: 'village', parentId }, parentId), false);
+});
+
 test('legacy dialect display names map only to one canonical active dialect', () => {
   const dialects = [
     { id: '20000000-0000-4000-8000-000000000001', code: 'oguz', nameUz: 'O‘g‘uz' },
@@ -71,6 +79,7 @@ test('approved custom district uses only the moderator-selected canonical distri
   assert.deepEqual(resolveRegionForPublication(proposal, { districtId }), {
     districtId,
     villageId: null,
+    neighborhoodId: null,
     neighborhood: null,
     matchedRegionId: districtId,
     resolution: 'canonical',
@@ -83,9 +92,24 @@ test('unresolved village is safely generalized to the moderator-selected distric
   assert.deepEqual(resolveRegionForPublication(proposal, { districtId }), {
     districtId,
     villageId: null,
+    neighborhoodId: null,
     neighborhood: null,
     matchedRegionId: null,
     resolution: 'generalized',
+  });
+});
+
+test('approved custom neighborhood can map only to a canonical neighborhood id', () => {
+  const districtId = '10000000-0000-4000-8000-000000000002';
+  const neighborhoodId = '30000000-0000-4000-8000-000000000001';
+  const proposal = parseRegionSuggestion({ nameUz: 'Yangi mahalla', level: 'neighborhood', parentRegionId: districtId }, XORAZM_ID)!;
+  assert.deepEqual(resolveRegionForPublication(proposal, { districtId, neighborhoodId }), {
+    districtId,
+    villageId: null,
+    neighborhoodId,
+    neighborhood: null,
+    matchedRegionId: neighborhoodId,
+    resolution: 'canonical',
   });
 });
 

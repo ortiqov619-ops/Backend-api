@@ -74,7 +74,10 @@ export type AuditAction =
   | 'user.role_change'
   | 'app_user.block'
   | 'app_user.unblock'
-  | 'content.update';
+  | 'content.update'
+  | 'api_key.create'
+  | 'api_key.rotate'
+  | 'api_key.revoke';
 
 export type AuditEntityType =
   | 'user'
@@ -86,7 +89,8 @@ export type AuditEntityType =
   | 'dialect'
   | 'integration_secret'
   | 'app_release'
-  | 'app_content';
+  | 'app_content'
+  | 'application_api_key';
 
 export interface AuditLogEntry {
   id: Uuid;

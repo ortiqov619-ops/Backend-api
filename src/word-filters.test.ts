@@ -52,10 +52,10 @@ test('qidiruv so‘z, ma’no va adabiy shaklni qamraydi', () => {
   assert.deepEqual(params, ['%gelyatir%']);
 });
 
-test('hudud filtri viloyat, tuman va qishloqni birga qidiradi', () => {
+test('hudud filtri viloyat, tuman, qishloq va mahallani birga qidiradi', () => {
   const regionId = '00000000-0000-4000-8000-000000000001';
   const { clause, params } = buildWordListFilters({ status: 'all', regionId }, options(true));
-  assert.equal(clause, 'WHERE (w.region_id = $1 OR w.district_id = $1 OR w.village_id = $1)');
+  assert.equal(clause, 'WHERE (w.region_id = $1 OR w.district_id = $1 OR w.village_id = $1 OR w.neighborhood_id = $1)');
   assert.deepEqual(params, [regionId]);
 });
 
@@ -93,7 +93,7 @@ test('bir nechta filtr parametr raqamlarini buzmasdan birlashadi', () => {
     clause,
     'WHERE w.status = $1::word_status'
     + ' AND (w.word ILIKE $2 OR w.meaning ILIKE $2 OR COALESCE(w.literary_form, \'\') ILIKE $2)'
-    + ' AND (w.region_id = $3 OR w.district_id = $3 OR w.village_id = $3)'
+    + ' AND (w.region_id = $3 OR w.district_id = $3 OR w.village_id = $3 OR w.neighborhood_id = $3)'
     + ' AND w.category = $4',
   );
   assert.deepEqual(params, ['published', '%suv%', regionId, 'maishiy']);

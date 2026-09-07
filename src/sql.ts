@@ -120,8 +120,8 @@ export const WORD_AUDIO_MATCH_SQL = `au.superseded_at IS NULL
 
 export const WORD_HAS_AUDIO_SQL = `EXISTS (SELECT 1 FROM audio_submissions au WHERE ${WORD_AUDIO_MATCH_SQL})`;
 
-/** So'z shu hududga tegishlimi — ierarxiyaning uch pog'onasi. */
-export const REGION_MATCH_SQL = `(w.region_id = r.id OR w.district_id = r.id OR w.village_id = r.id)`;
+/** So'z shu hududga tegishlimi — viloyatdan mahallagacha. */
+export const REGION_MATCH_SQL = `(w.region_id = r.id OR w.district_id = r.id OR w.village_id = r.id OR w.neighborhood_id = r.id)`;
 
 /**
  * Atlas uchun OCHIQ hudud statistikasi.

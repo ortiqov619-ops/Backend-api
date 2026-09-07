@@ -28,6 +28,9 @@ export interface ContributionPayload {
   regionId?: Uuid;
   districtId?: Uuid;
   villageId?: Uuid;
+  /** Rasmiy katalogdagi mahalla. Yangi mijozlar erkin matn o‘rniga shu IDni yuboradi. */
+  neighborhoodId?: Uuid;
+  /** Eski mobil versiyalar bilan moslik uchun qolgan erkin matnli mahalla nomi. */
   neighborhood?: string;
   proposedRegion?: ProposedRegion;
 }

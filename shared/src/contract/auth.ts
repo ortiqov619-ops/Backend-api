@@ -30,7 +30,9 @@ export type Permission =
   | 'releases:read'
   | 'releases:write'
   | 'content:read'
-  | 'content:write';
+  | 'content:write'
+  | 'api_keys:read'
+  | 'api_keys:write';
 
 export const ROLE_PERMISSIONS: Record<AdminRole, readonly Permission[]> = {
   admin: [
@@ -54,6 +56,8 @@ export const ROLE_PERMISSIONS: Record<AdminRole, readonly Permission[]> = {
     'releases:write',
     'content:read',
     'content:write',
+    'api_keys:read',
+    'api_keys:write',
   ],
   moderator: [
     'dashboard:read',

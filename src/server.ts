@@ -33,6 +33,7 @@ import {
 import {
   canBeChildOf,
   canCreateRegionUnder,
+  isDirectNeighborhoodChild,
   isDirectVillageChild,
   uniqueDialectIdByLabel,
   normalizeRegionName,
@@ -91,6 +92,15 @@ import { submitterDisplayName } from './guest-identity';
 import { blockedMessage, decideContributionAccess } from './contribution-access';
 import { buildWordListFilters, WordFilterValidationError } from './word-filters';
 import { appFeaturesFrom, SUPPORTED_INTEGRATIONS } from './feature-gate';
+import {
+  generateApplicationApiKey,
+  knownApplicationApiKeyScopes,
+  LAST_USED_THROTTLE_MINUTES,
+  matchesApplicationApiKey,
+  parseApplicationApiKey,
+  parseApplicationApiKeyScopes,
+} from './application-api-keys';
+import type { ApplicationApiKeyScope } from '@xorazm/shared';
 
 assertProductionConfig();
 // Service account bir marta o'qiladi. Sozlanmagan bo'lsa `null` bo'lib
@@ -174,10 +184,20 @@ async function enforceRateLimit(
   windowSeconds: number,
   message = 'Juda ko‘p so‘rov yuborildi. Biroz kutib qayta urinib ko‘ring.',
 ): Promise<boolean> {
-  const { windowStartMs, resetAtMs } = fixedWindow(Date.now(), windowSeconds);
   // IP manzilni ochiq saqlamaymiz. `trustProxy` faqat hosting proxylarida
   // yoqiladi, shuning uchun barcha foydalanuvchi bitta internal IP bo'lib qolmaydi.
   const bucket = `${scope}:${hashToken(request.ip).slice(0, 32)}`;
+  return enforceRateLimitBucket(reply, bucket, limit, windowSeconds, message);
+}
+
+async function enforceRateLimitBucket(
+  reply: FastifyReply,
+  bucket: string,
+  limit: number,
+  windowSeconds: number,
+  message = 'Juda ko‘p so‘rov yuborildi. Biroz kutib qayta urinib ko‘ring.',
+): Promise<boolean> {
+  const { windowStartMs, resetAtMs } = fixedWindow(Date.now(), windowSeconds);
   const result = await db.query<{ request_count: number }>(
     `INSERT INTO api_rate_limits (bucket, window_start_ms, request_count, expires_at)
      VALUES ($1,$2,1,to_timestamp($3 / 1000.0))
@@ -202,6 +222,92 @@ async function enforceRateLimit(
   reply.header('Retry-After', String(Math.max(1, Math.ceil((resetAtMs - Date.now()) / 1_000))));
   apiError(reply, 429, 'rate_limited', message);
   return false;
+}
+
+type ApplicationApiKeyClaims = {
+  id: string;
+  name: string;
+  scopes: ApplicationApiKeyScope[];
+};
+
+/**
+ * Muvaffaqiyatsiz API-kalit urinishlari uchun IP chegarasi.
+ *
+ * Kalit chegarasi faqat MUVAFFAQIYATLI autentifikatsiyadan keyin
+ * qo'llanadi, ya'ni usiz noto'g'ri kalit bilan cheksiz urinish mumkin
+ * bo'lardi va har urinish bitta baza so'roviga tushardi. Bu — `public_id`
+ * ni taxmin qilishga urinishning narxi.
+ */
+async function rejectApiKeyAttempt(
+  request: FastifyRequest,
+  reply: FastifyReply,
+  status: 401 | 403,
+  message: string,
+): Promise<null> {
+  const bucket = `api-key-auth-fail:${hashToken(request.ip).slice(0, 32)}`;
+  // Chegaradan oshsa `enforceRateLimitBucket` 429 ni o'zi yuboradi.
+  if (!(await enforceRateLimitBucket(reply, bucket, 60, 15 * 60, 'Juda ko‘p muvaffaqiyatsiz API kalit urinishi.'))) {
+    return null;
+  }
+  apiError(reply, status, status === 401 ? 'unauthorized' : 'forbidden', message);
+  return null;
+}
+
+/** API key admin JWT bilan aralashmaydi: faqat `X-API-Key` yoki `ApiKey` sxemasi. */
+async function requireApplicationApiKey(
+  request: FastifyRequest,
+  reply: FastifyReply,
+  requiredScope: ApplicationApiKeyScope,
+): Promise<ApplicationApiKeyClaims | null> {
+  const directHeader = request.headers['x-api-key'];
+  const direct = typeof directHeader === 'string' ? directHeader.trim() : '';
+  const authorization = request.headers.authorization ?? '';
+  const token = direct || (authorization.startsWith('ApiKey ') ? authorization.slice(7).trim() : '');
+  const parsed = parseApplicationApiKey(token);
+  if (!parsed) {
+    return rejectApiKeyAttempt(request, reply, 401, 'API kaliti noto‘g‘ri yoki amal qilmaydi.');
+  }
+
+  const result = await db.query(
+    `SELECT id, name, secret_hash, scopes, rate_limit_per_hour
+       FROM application_api_keys
+      WHERE public_id=$1 AND is_active=true
+        AND (expires_at IS NULL OR expires_at > now())`,
+    [parsed.publicId],
+  );
+  const row = result.rows[0];
+  if (!row || !matchesApplicationApiKey(token, String(row.secret_hash))) {
+    // Bekor qilingan, muddati tugagan, noma'lum va noto'g'ri kalit —
+    // hammasi bir xil javob oladi: qaysi biri ekanini aytish
+    // hujumchiga foydali ma'lumot berardi.
+    return rejectApiKeyAttempt(request, reply, 401, 'API kaliti noto‘g‘ri yoki amal qilmaydi.');
+  }
+
+  // Bazadagi noma'lum scope bu yerda xato tashlamaydi — izohi
+  // `application-api-keys.ts` da.
+  const scopes = knownApplicationApiKeyScopes(row.scopes);
+  if (!scopes.includes(requiredScope)) {
+    return rejectApiKeyAttempt(request, reply, 403, 'API kalitida bu amal uchun ruxsat yo‘q.');
+  }
+  if (!(await enforceRateLimitBucket(
+    reply,
+    `application-api-key:${row.id}`,
+    Number(row.rate_limit_per_hour),
+    60 * 60,
+    'Bu API kaliti uchun soatlik so‘rov chegarasi tugadi.',
+  ))) return null;
+
+  // Cheklangan va bloklamaydigan yozuv: har so'rovda `UPDATE` qilish
+  // javobga kechikish qo'shar va bazaga keraksiz yuk berardi.
+  void db.query(
+    `UPDATE application_api_keys
+        SET last_used_at=now(), last_used_ip=$2
+      WHERE id=$1
+        AND (last_used_at IS NULL OR last_used_at < now() - ($3 || ' minutes')::interval)`,
+    [row.id, request.ip, String(LAST_USED_THROTTLE_MINUTES)],
+  ).catch((error: unknown) => app.log.warn({ err: error, keyId: row.id }, 'API kalit faolligi yozilmadi'));
+
+  return { id: String(row.id), name: String(row.name), scopes };
 }
 
 async function claimsFor(request: FastifyRequest, permission?: string): Promise<Claims | null> {
@@ -253,7 +359,28 @@ function mapDialect(row: QueryResultRow) {
   return { id: row.id, code: row.code, nameUz: row.name_uz, description: row.description, markerWords: row.marker_words ?? [], regionIds: row.region_ids ?? [], isActive: row.is_active, createdAt: iso(row.created_at), updatedAt: iso(row.updated_at) };
 }
 function mapWord(row: QueryResultRow) {
-  return { id: row.id, word: row.word, literaryForm: row.literary_form, meaning: row.meaning, example: row.example, category: row.category, phoneticKey: row.phonetic_key, status: row.status, regionId: row.region_id, districtId: row.district_id, villageId: row.village_id, dialectId: row.dialect_id, clan: row.clan, dialectScore: row.dialect_score, sourceRequestId: row.source_request_id, hasAudio: Boolean(row.has_audio), createdBy: row.created_by ?? null, archivedAt: iso(row.archived_at), archiveReason: row.archive_reason, createdAt: iso(row.created_at), updatedAt: iso(row.updated_at) };
+  return { id: row.id, word: row.word, literaryForm: row.literary_form, meaning: row.meaning, example: row.example, category: row.category, phoneticKey: row.phonetic_key, status: row.status, regionId: row.region_id, districtId: row.district_id, villageId: row.village_id, neighborhoodId: row.neighborhood_id, dialectId: row.dialect_id, clan: row.clan, dialectScore: row.dialect_score, sourceRequestId: row.source_request_id, hasAudio: Boolean(row.has_audio), createdBy: row.created_by ?? null, archivedAt: iso(row.archived_at), archiveReason: row.archive_reason, createdAt: iso(row.created_at), updatedAt: iso(row.updated_at) };
+}
+
+function mapApplicationApiKey(row: QueryResultRow) {
+  return {
+    id: String(row.id),
+    name: String(row.name),
+    publicId: String(row.public_id),
+    maskedHint: String(row.masked_hint),
+    scopes: row.scopes ?? [],
+    expiresAt: iso(row.expires_at),
+    rateLimitPerHour: Number(row.rate_limit_per_hour),
+    isActive: Boolean(row.is_active),
+    lastUsedAt: iso(row.last_used_at),
+    lastUsedIp: row.last_used_ip ? String(row.last_used_ip) : null,
+    revokedAt: iso(row.revoked_at),
+    revokeReason: row.revoke_reason ?? null,
+    createdBy: row.created_by ?? null,
+    createdByName: row.created_by_name ?? null,
+    createdAt: requiredIso(row.created_at),
+    updatedAt: requiredIso(row.updated_at),
+  };
 }
 
 /**
@@ -387,6 +514,7 @@ async function payloadForPublication(source: Json, overrides: Json, client: Pool
     // ammo Word uchun faqat explicit override ishlatiladi.
     const explicitDistrictId = asString(overrides.districtId) || null;
     const explicitVillageId = asString(overrides.villageId) || null;
+    const explicitNeighborhoodId = asString(overrides.neighborhoodId) || null;
     const explicitNeighborhood = asString(overrides.neighborhood) || null;
     if (explicitVillageId) {
       const village = await client.query('SELECT level::text, parent_id FROM regions WHERE id=$1 AND is_contribution_allowed=true', [explicitVillageId]);
@@ -398,10 +526,12 @@ async function payloadForPublication(source: Json, overrides: Json, client: Pool
     const resolved = resolveRegionForPublication(proposal, {
       districtId: explicitDistrictId,
       villageId: explicitVillageId,
+      neighborhoodId: explicitNeighborhoodId,
       neighborhood: explicitNeighborhood,
     });
     payload.districtId = resolved.districtId ?? undefined;
     payload.villageId = resolved.villageId ?? undefined;
+    payload.neighborhoodId = resolved.neighborhoodId ?? undefined;
     payload.neighborhood = resolved.neighborhood ?? undefined;
     delete payload.proposedRegion;
     regionResolution = {
@@ -411,6 +541,7 @@ async function payloadForPublication(source: Json, overrides: Json, client: Pool
       matchedRegionId: resolved.matchedRegionId,
       publishedDistrictId: resolved.districtId,
       publishedVillageId: resolved.villageId,
+      publishedNeighborhoodId: resolved.neighborhoodId,
       publishedNeighborhood: resolved.neighborhood,
     };
   }
@@ -418,7 +549,7 @@ async function payloadForPublication(source: Json, overrides: Json, client: Pool
   // contribution payloadida audit uchun qoladi.
   delete payload.proposedRegion;
 
-  for (const [field, expectedLevel] of [['districtId', 'district'], ['villageId', 'village']] as const) {
+  for (const [field, expectedLevel] of [['districtId', 'district'], ['villageId', 'village'], ['neighborhoodId', 'neighborhood']] as const) {
     const selectedId = asString(payload[field]);
     if (!selectedId) {
       delete payload[field];
@@ -435,7 +566,7 @@ async function payloadForPublication(source: Json, overrides: Json, client: Pool
       (SELECT is_contribution_allowed FROM lineage WHERE id=$1) AS contribution_allowed`, [selectedId, regionId]);
     const selected = canonical.rows[0];
     if (!selected?.belongs_to_region || selected.selected_level !== expectedLevel || !selected.contribution_allowed) {
-      throw new RouteFault(422, 'validation_failed', 'So‘zning rasmiy tuman/qishloq tanlovi yaroqli emas.');
+      throw new RouteFault(422, 'validation_failed', 'So‘zning rasmiy tuman/qishloq/mahalla tanlovi yaroqli emas.');
     }
   }
   const publishedDistrictId = asString(payload.districtId) || null;
@@ -445,6 +576,15 @@ async function payloadForPublication(source: Json, overrides: Json, client: Pool
     const row = village.rows[0];
     if (!isDirectVillageChild(row ? { level: String(row.level), parentId: nullableString(row.parent_id) } : null, publishedDistrictId)) {
       throw new RouteFault(422, 'validation_failed', 'Tanlangan qishloq aynan tanlangan tumanga tegishli bo‘lishi kerak.');
+    }
+  }
+  const publishedNeighborhoodId = asString(payload.neighborhoodId) || null;
+  if (publishedNeighborhoodId) {
+    const neighborhood = await client.query('SELECT level::text, parent_id FROM regions WHERE id=$1 AND is_contribution_allowed=true', [publishedNeighborhoodId]);
+    const row = neighborhood.rows[0];
+    const expectedParentId = publishedVillageId || publishedDistrictId;
+    if (!isDirectNeighborhoodChild(row ? { level: String(row.level), parentId: nullableString(row.parent_id) } : null, expectedParentId)) {
+      throw new RouteFault(422, 'validation_failed', 'Tanlangan mahalla aynan tanlangan qishloq yoki tumanga tegishli bo‘lishi kerak.');
     }
   }
 
@@ -755,8 +895,17 @@ async function transcribe(buffer: Buffer, filename: string, mimeType: string): P
 
 app.get('/health', async (_request, reply) => {
   try {
-    await db.query('SELECT 1');
-    return { status: 'ok', service: 'xorazm-api', database: 'connected', time: new Date().toISOString() };
+    const [, migrations] = await Promise.all([
+      db.query('SELECT 1'),
+      db.query('SELECT name FROM schema_migrations ORDER BY name DESC LIMIT 1'),
+    ]);
+    return {
+      status: 'ok',
+      service: 'xorazm-api',
+      database: 'connected',
+      schemaVersion: migrations.rows[0]?.name ?? null,
+      time: new Date().toISOString(),
+    };
   } catch {
     return reply.status(503).send({ status: 'error', service: 'xorazm-api', database: 'unavailable' });
   }
@@ -1961,8 +2110,8 @@ app.post('/v3/admin/words', async (request, reply) => {
   if (!word || !meaning || !reason) return apiError(reply, 422, 'validation_failed', 'So‘z, ma’no va kiritish sababi majburiy.');
   const exists = await db.query(`SELECT id FROM words WHERE status <> 'archived' AND phonetic_key=$1 LIMIT 1`, [phoneticKey(word)]);
   if (exists.rows[0]) return apiError(reply, 409, 'conflict', 'Shunga o‘xshash so‘z lug‘atda allaqachon bor.');
-  const created = await db.query(`INSERT INTO words (word,literary_form,meaning,example,category,phonetic_key,status,region_id,district_id,dialect_id)
-    VALUES ($1,$2,$3,$4,$5,$6,'published',$7,$8,$9) RETURNING *`, [word, body.literaryForm ?? null, meaning, body.example ?? null, body.category ?? null, phoneticKey(word), body.regionId ?? null, body.districtId ?? null, body.dialectId ?? null]);
+  const created = await db.query(`INSERT INTO words (word,literary_form,meaning,example,category,phonetic_key,status,region_id,district_id,village_id,neighborhood_id,dialect_id)
+    VALUES ($1,$2,$3,$4,$5,$6,'published',$7,$8,$9,$10,$11) RETURNING *`, [word, body.literaryForm ?? null, meaning, body.example ?? null, body.category ?? null, phoneticKey(word), body.regionId ?? null, body.districtId ?? null, body.villageId ?? null, body.neighborhoodId ?? null, body.dialectId ?? null]);
   const auditLogId = await audit(claims, 'word.create', 'word', created.rows[0].id, reason, { word, meaning, source: 'admin_direct' }, request);
   return reply.status(201).send({ word: mapWord(created.rows[0]), auditLogId });
 });
@@ -2022,8 +2171,10 @@ app.post('/v3/contributions/words', async (request, reply) => {
       ? 'districtId'
       : proposedRegion.level === 'village'
         ? 'villageId'
-        : 'neighborhood';
-    if (asString(payload[conflictField])) {
+        : 'neighborhoodId';
+    const hasRegionConflict = asString(payload[conflictField])
+      || (proposedRegion.level === 'neighborhood' ? asString(payload.neighborhood) : '');
+    if (hasRegionConflict) {
       return apiError(reply, 422, 'validation_failed', 'Rasmiy hudud va “Boshqa” hududni bir vaqtda tanlab bo‘lmaydi.', {
         [`payload.${conflictField}`]: ['Bittasini tanlang.'],
         'payload.proposedRegion': ['Bittasini tanlang.'],
@@ -2081,7 +2232,7 @@ app.post('/v3/contributions/words', async (request, reply) => {
     delete payload.proposedRegion;
   }
 
-  for (const [field, expectedLevel] of [['districtId', 'district'], ['villageId', 'village']] as const) {
+  for (const [field, expectedLevel] of [['districtId', 'district'], ['villageId', 'village'], ['neighborhoodId', 'neighborhood']] as const) {
     const selectedId = asString(payload[field]);
     if (!selectedId) continue;
     if (!isUuid(selectedId)) return apiError(reply, 422, 'validation_failed', 'Tanlangan hudud identifikatori noto‘g‘ri.', { [`payload.${field}`]: ['Hududni qayta tanlang.'] });
@@ -2095,7 +2246,7 @@ app.post('/v3/contributions/words', async (request, reply) => {
       (SELECT is_contribution_allowed FROM lineage WHERE id=$1) AS contribution_allowed`, [selectedId, requestedRegionId]);
     const selection = selected.rows[0];
     if (!selection?.belongs_to_region || selection.selected_level !== expectedLevel || !selection.contribution_allowed) {
-      return apiError(reply, 422, 'validation_failed', 'Tanlangan tuman/qishloq viloyatga mos emas yoki hissa uchun yopiq.', { [`payload.${field}`]: ['Hududni qayta tanlang.'] });
+      return apiError(reply, 422, 'validation_failed', 'Tanlangan tuman/qishloq/mahalla viloyatga mos emas yoki hissa uchun yopiq.', { [`payload.${field}`]: ['Hududni qayta tanlang.'] });
     }
   }
   const selectedDistrictId = asString(payload.districtId) || null;
@@ -2109,6 +2260,23 @@ app.post('/v3/contributions/words', async (request, reply) => {
         'payload.districtId': ['Qishloqning tumanini tanlang.'],
       });
     }
+  }
+  const selectedNeighborhoodId = asString(payload.neighborhoodId) || null;
+  if (selectedNeighborhoodId) {
+    const neighborhood = await db.query('SELECT level::text, parent_id FROM regions WHERE id=$1 AND is_contribution_allowed=true', [selectedNeighborhoodId]);
+    const row = neighborhood.rows[0];
+    const expectedParentId = selectedVillageId || selectedDistrictId;
+    if (!isDirectNeighborhoodChild(row ? { level: String(row.level), parentId: nullableString(row.parent_id) } : null, expectedParentId)) {
+      return apiError(reply, 422, 'validation_failed', 'Tanlangan mahalla aynan tanlangan qishloq yoki tumanga tegishli bo‘lishi kerak.', {
+        'payload.neighborhoodId': ['Mos mahallani tanlang.'],
+      });
+    }
+  }
+  if (selectedNeighborhoodId && asString(payload.neighborhood)) {
+    return apiError(reply, 422, 'validation_failed', 'Rasmiy mahalla va erkin matnli mahallani bir vaqtda yuborib bo‘lmaydi.', {
+      'payload.neighborhoodId': ['Bittasini tanlang.'],
+      'payload.neighborhood': ['Bittasini tanlang.'],
+    });
   }
   // Erkin matnli hudud maydonlari: mahalla nomi va urug'/laqab. Ular
   // katalogga bog'lanmaydi, shuning uchun bu yerda cheklanadi.
@@ -2541,14 +2709,14 @@ app.patch('/v3/requests/:id/status', async (request, reply) => {
       dialectResolution = publication.dialectResolution;
       const published = publication.payload;
       storedPayload.regionId = published.regionId;
-      for (const field of ['districtId', 'villageId', 'neighborhood'] as const) {
+      for (const field of ['districtId', 'villageId', 'neighborhoodId', 'neighborhood'] as const) {
         if (published[field]) storedPayload[field] = published[field];
         else delete storedPayload[field];
       }
       // `created_by` — hissa qo'shgan hisob, moderator emas. Bu munosabat
       // keyin kerak bo'ladi: so'zga izoh yozilganda yoki u yoqtirilganda
       // xabar aynan muallifga boradi.
-      const createdWord = await client.query(`INSERT INTO words (word, literary_form, meaning, example, category, phonetic_key, status, region_id, district_id, village_id, dialect_id, clan, dialect_score, source_request_id, created_by, updated_by) VALUES ($1,$2,$3,$4,$5,$6,'published',$7,$8,$9,$10,$11,$12,$13,$14::uuid,$15::uuid) RETURNING id`, [published.word, published.literaryForm ?? null, published.meaning, published.example ?? null, published.category ?? null, phoneticKey(String(published.word)), published.regionId ?? null, published.districtId ?? null, published.villageId ?? null, published.dialectId ?? null, published.clan ?? null, previous.validation_score, id, previous.submitted_by_user_id ?? null, claims.sub]);
+      const createdWord = await client.query(`INSERT INTO words (word, literary_form, meaning, example, category, phonetic_key, status, region_id, district_id, village_id, neighborhood_id, dialect_id, clan, dialect_score, source_request_id, created_by, updated_by) VALUES ($1,$2,$3,$4,$5,$6,'published',$7,$8,$9,$10,$11,$12,$13,$14,$15::uuid,$16::uuid) RETURNING id`, [published.word, published.literaryForm ?? null, published.meaning, published.example ?? null, published.category ?? null, phoneticKey(String(published.word)), published.regionId ?? null, published.districtId ?? null, published.villageId ?? null, published.neighborhoodId ?? null, published.dialectId ?? null, published.clan ?? null, previous.validation_score, id, previous.submitted_by_user_id ?? null, claims.sub]);
       wordId = createdWord.rows[0].id;
     }
     // Parametr turlari nozik — izohi `sql.ts` da.
@@ -2601,7 +2769,7 @@ app.patch('/v3/words/:id', async (request, reply) => {
   if (!reason) return apiError(reply, 422, 'validation_failed', 'O‘zgarish sababi majburiy.');
   const current = await db.query('SELECT * FROM words WHERE id=$1', [id]); if (!current.rows[0]) return apiError(reply, 404, 'not_found', 'So‘z topilmadi.');
   const previous = current.rows[0]; const word = asString(body.word) || previous.word;
-  const updated = await db.query(`UPDATE words SET word=$2, literary_form=COALESCE($3,literary_form), meaning=$4, example=COALESCE($5,example), category=COALESCE($6,category), region_id=COALESCE($7,region_id), district_id=COALESCE($8,district_id), village_id=COALESCE($9,village_id), dialect_id=COALESCE($10,dialect_id), clan=COALESCE($11,clan), status=COALESCE($12,status), phonetic_key=$13 WHERE id=$1 RETURNING *`, [id, word, body.literaryForm ?? null, asString(body.meaning) || previous.meaning, body.example ?? null, body.category ?? null, body.regionId ?? null, body.districtId ?? null, body.villageId ?? null, body.dialectId ?? null, body.clan ?? null, body.status ?? null, phoneticKey(word)]);
+  const updated = await db.query(`UPDATE words SET word=$2, literary_form=COALESCE($3,literary_form), meaning=$4, example=COALESCE($5,example), category=COALESCE($6,category), region_id=COALESCE($7,region_id), district_id=COALESCE($8,district_id), village_id=COALESCE($9,village_id), neighborhood_id=COALESCE($10,neighborhood_id), dialect_id=COALESCE($11,dialect_id), clan=COALESCE($12,clan), status=COALESCE($13,status), phonetic_key=$14 WHERE id=$1 RETURNING *`, [id, word, body.literaryForm ?? null, asString(body.meaning) || previous.meaning, body.example ?? null, body.category ?? null, body.regionId ?? null, body.districtId ?? null, body.villageId ?? null, body.neighborhoodId ?? null, body.dialectId ?? null, body.clan ?? null, body.status ?? null, phoneticKey(word)]);
   await audit(claims, 'word.update', 'word', id, reason, { word, meaning: updated.rows[0].meaning }, request);
   return { word: mapWord(updated.rows[0]), auditLogId: newId() };
 });
@@ -2640,6 +2808,185 @@ app.get('/v3/admin/audit-logs', async (request, reply) => {
   const current=page(query.page); const size=pageSize(query.pageSize); const count=await db.query(`SELECT count(*)::int AS total FROM audit_logs ${where.length ? `WHERE ${where.join(' AND ')}` : ''}`,params); params.push(size,(current-1)*size);
   const rows=await db.query(`SELECT * FROM audit_logs ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY created_at DESC LIMIT $${params.length-1} OFFSET $${params.length}`,params); const total=count.rows[0].total;
   return { items: rows.rows.map((row) => ({ id:String(row.id), action:row.action, entityType:row.entity_type, entityId:row.entity_id, actorId:row.actor_id, actorName:row.actor_name, actorRoles:row.actor_roles ?? [], ipAddress:row.ip_address, userAgent:row.user_agent, before:row.before_data, after:row.after_data, changedFields:row.changed_fields ?? [], reason:row.reason, createdAt:iso(row.created_at) })), meta:{ page:current,pageSize:size,total,totalPages:Math.ceil(total/size) } };
+});
+
+/* ---------------------- Application API kalitlari -------------------- */
+
+app.get('/v3/admin/api-keys', async (request, reply) => {
+  if (!(await requirePermission(request, reply, 'api_keys:read'))) return;
+  const query = request.query as Json;
+  const params: unknown[] = [];
+  const where: string[] = [];
+  const status = asString(query.status) || 'all';
+  if (!['active', 'revoked', 'expired', 'all'].includes(status)) {
+    return apiError(reply, 422, 'validation_failed', 'API kalit holati noto‘g‘ri.');
+  }
+  if (status === 'active') where.push('k.is_active=true AND (k.expires_at IS NULL OR k.expires_at > now())');
+  if (status === 'revoked') where.push('k.is_active=false');
+  if (status === 'expired') where.push('k.is_active=true AND k.expires_at <= now()');
+  const search = asString(query.search);
+  if (search) {
+    params.push(`%${search}%`);
+    where.push(`(k.name ILIKE $${params.length} OR k.public_id ILIKE $${params.length})`);
+  }
+  const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  const current = page(query.page);
+  const size = pageSize(query.pageSize);
+  const count = await db.query(`SELECT count(*)::int AS total FROM application_api_keys k ${clause}`, params);
+  params.push(size, (current - 1) * size);
+  const rows = await db.query(
+    // `secret_hash` ATAYLAB tanlanmaydi: mapper uni baribir tashlaydi,
+    // lekin uni umuman o'qimaslik xavfsizroq.
+    `SELECT k.id, k.public_id, k.name, k.masked_hint, k.scopes, k.expires_at,
+            k.rate_limit_per_hour, k.is_active, k.last_used_at, k.last_used_ip,
+            k.revoked_at, k.revoke_reason, k.created_by, k.created_at, k.updated_at,
+            u.full_name AS created_by_name
+       FROM application_api_keys k
+       LEFT JOIN users u ON u.id=k.created_by
+       ${clause}
+      ORDER BY k.created_at DESC
+      LIMIT $${params.length - 1} OFFSET $${params.length}`,
+    params,
+  );
+  const total = Number(count.rows[0]?.total ?? 0);
+  return {
+    items: rows.rows.map(mapApplicationApiKey),
+    meta: { page: current, pageSize: size, total, totalPages: Math.ceil(total / size) },
+  };
+});
+
+app.post('/v3/admin/api-keys', async (request, reply) => {
+  const claims = await requirePermission(request, reply, 'api_keys:write');
+  if (!claims) return;
+  const body = asObject(request.body);
+  const name = asString(body.name).replace(/\s+/g, ' ');
+  const reason = asString(body.changeReason);
+  if (name.length < 2 || name.length > 80) return apiError(reply, 422, 'validation_failed', 'Kalit nomi 2–80 ta belgidan iborat bo‘lishi kerak.');
+  if (reason.length < 3 || reason.length > 500) return apiError(reply, 422, 'validation_failed', 'Yaratish sababini kamida 3 ta belgi bilan yozing.');
+  let scopes: ApplicationApiKeyScope[];
+  try {
+    scopes = parseApplicationApiKeyScopes(body.scopes);
+  } catch (error) {
+    return apiError(reply, 422, 'validation_failed', error instanceof Error ? error.message : 'API kalit ruxsatlari noto‘g‘ri.');
+  }
+  const rateLimitPerHour = body.rateLimitPerHour == null ? 1000 : Number(body.rateLimitPerHour);
+  if (!Number.isInteger(rateLimitPerHour) || rateLimitPerHour < 10 || rateLimitPerHour > 10_000) {
+    return apiError(reply, 422, 'validation_failed', 'Soatlik limit 10–10000 oralig‘ida bo‘lishi kerak.');
+  }
+  let expiresAt: Date | null = null;
+  if (body.expiresAt != null && asString(body.expiresAt)) {
+    expiresAt = new Date(asString(body.expiresAt));
+    if (Number.isNaN(expiresAt.getTime()) || expiresAt.getTime() < Date.now() + 5 * 60_000) {
+      return apiError(reply, 422, 'validation_failed', 'Amal qilish muddati kelajakda bo‘lishi kerak.');
+    }
+    if (expiresAt.getTime() > Date.now() + 5 * 365 * 24 * 60 * 60_000) {
+      return apiError(reply, 422, 'validation_failed', 'API kalit muddati 5 yildan oshmasligi kerak.');
+    }
+  }
+
+  const generated = generateApplicationApiKey();
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    const created = await client.query(
+      `INSERT INTO application_api_keys
+        (public_id, name, secret_hash, masked_hint, scopes, expires_at, rate_limit_per_hour, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+      [generated.publicId, name, generated.secretHash, generated.maskedHint, scopes, expiresAt, rateLimitPerHour, claims.sub],
+    );
+    const auditLogId = await audit(claims, 'api_key.create', 'application_api_key', created.rows[0].id, reason, {
+      name,
+      publicId: generated.publicId,
+      scopes,
+      expiresAt: expiresAt?.toISOString() ?? null,
+      rateLimitPerHour,
+      secret: '***',
+    }, request, client);
+    await client.query('COMMIT');
+    return reply.status(201).send({ key: mapApplicationApiKey(created.rows[0]), secret: generated.token, auditLogId });
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    return failFromError(reply, error, 'api_key.create');
+  } finally {
+    client.release();
+  }
+});
+
+app.post('/v3/admin/api-keys/:id/rotate', async (request, reply) => {
+  const claims = await requirePermission(request, reply, 'api_keys:write');
+  if (!claims) return;
+  const id = asString((request.params as Json).id);
+  const reason = asString(asObject(request.body).changeReason);
+  if (!isUuid(id)) return apiError(reply, 404, 'not_found', 'API kaliti topilmadi.');
+  if (reason.length < 3 || reason.length > 500) return apiError(reply, 422, 'validation_failed', 'Rotatsiya sababini kamida 3 ta belgi bilan yozing.');
+  const generated = generateApplicationApiKey();
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    const current = await client.query('SELECT * FROM application_api_keys WHERE id=$1 FOR UPDATE', [id]);
+    const previous = current.rows[0];
+    if (!previous) throw new RouteFault(404, 'not_found', 'API kaliti topilmadi.');
+    if (!previous.is_active || (previous.expires_at && new Date(previous.expires_at).getTime() <= Date.now())) {
+      throw new RouteFault(409, 'conflict', 'Bekor qilingan yoki muddati tugagan kalitni aylantirib bo‘lmaydi. Yangisini yarating.');
+    }
+    await client.query(
+      `UPDATE application_api_keys
+          SET is_active=false, revoked_at=now(), revoked_by=$2, revoke_reason=$3
+        WHERE id=$1`,
+      [id, claims.sub, `Rotatsiya: ${reason}`],
+    );
+    const created = await client.query(
+      `INSERT INTO application_api_keys
+        (public_id, name, secret_hash, masked_hint, scopes, expires_at, rate_limit_per_hour, rotated_from_id, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+      [generated.publicId, previous.name, generated.secretHash, generated.maskedHint, previous.scopes, previous.expires_at, previous.rate_limit_per_hour, id, claims.sub],
+    );
+    const auditLogId = await audit(claims, 'api_key.rotate', 'application_api_key', created.rows[0].id, reason, {
+      previousKeyId: id,
+      publicId: generated.publicId,
+      scopes: previous.scopes,
+      secret: '***',
+    }, request, client);
+    await client.query('COMMIT');
+    return { key: mapApplicationApiKey(created.rows[0]), secret: generated.token, auditLogId };
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    return failFromError(reply, error, 'api_key.rotate');
+  } finally {
+    client.release();
+  }
+});
+
+app.post('/v3/admin/api-keys/:id/revoke', async (request, reply) => {
+  const claims = await requirePermission(request, reply, 'api_keys:write');
+  if (!claims) return;
+  const id = asString((request.params as Json).id);
+  const reason = asString(asObject(request.body).reason);
+  if (!isUuid(id)) return apiError(reply, 404, 'not_found', 'API kaliti topilmadi.');
+  if (reason.length < 3 || reason.length > 500) return apiError(reply, 422, 'validation_failed', 'Bekor qilish sababini kamida 3 ta belgi bilan yozing.');
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    const updated = await client.query(
+      `UPDATE application_api_keys
+          SET is_active=false, revoked_at=now(), revoked_by=$2, revoke_reason=$3
+        WHERE id=$1 AND is_active=true
+      RETURNING *`,
+      [id, claims.sub, reason],
+    );
+    if (!updated.rows[0]) throw new RouteFault(409, 'conflict', 'API kaliti topilmadi yoki avval bekor qilingan.');
+    const auditLogId = await audit(claims, 'api_key.revoke', 'application_api_key', id, reason, {
+      publicId: updated.rows[0].public_id,
+      revoked: true,
+    }, request, client);
+    await client.query('COMMIT');
+    return { key: mapApplicationApiKey(updated.rows[0]), auditLogId };
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    return failFromError(reply, error, 'api_key.revoke');
+  } finally {
+    client.release();
+  }
 });
 
 /**
@@ -2748,6 +3095,56 @@ async function readAppContent(activeOnly: boolean) {
  * ekranidagi qisqa intro ham shu manbadan oziqlanadi.
  */
 app.get('/v3/app/content', async () => ({ content: await readAppContent(true) }));
+
+/**
+ * Tashqi integratsiyalar uchun barqaror, faqat o'qish API si. Bu yo'llar
+ * admin JWTni qabul qilmaydi va API key ham admin/write endpointlariga
+ * kira olmaydi.
+ */
+app.get('/v3/external/dictionary/words', async (request, reply) => {
+  if (!(await requireApplicationApiKey(request, reply, 'dictionary:read'))) return;
+  const query = request.query as Json;
+  let filters: ReturnType<typeof buildWordListFilters>;
+  try {
+    filters = buildWordListFilters(query, { isAdmin: false, hasAudioSql: WORD_HAS_AUDIO_SQL });
+  } catch (error) {
+    if (error instanceof WordFilterValidationError) {
+      return apiError(reply, 422, 'validation_failed', error.message, { [error.field]: [error.message] });
+    }
+    throw error;
+  }
+  const params = [...filters.params];
+  const current = page(query.page);
+  const size = pageSize(query.pageSize);
+  const count = await db.query(`SELECT count(*)::int AS total FROM words w ${filters.clause}`, params);
+  params.push(size, (current - 1) * size);
+  const rows = await db.query(
+    `SELECT w.*, ${WORD_HAS_AUDIO_SQL} AS has_audio
+       FROM words w ${filters.clause}
+      ORDER BY w.word ASC
+      LIMIT $${params.length - 1} OFFSET $${params.length}`,
+    params,
+  );
+  const total = Number(count.rows[0]?.total ?? 0);
+  return { items: rows.rows.map(mapWord), meta: { page: current, pageSize: size, total, totalPages: Math.ceil(total / size) } };
+});
+
+app.get('/v3/external/dictionary/regions', async (request, reply) => {
+  if (!(await requireApplicationApiKey(request, reply, 'dictionary:read'))) return;
+  const rows = await db.query('SELECT * FROM regions ORDER BY sort_order, name_uz');
+  return { items: rows.rows.map(mapRegion) };
+});
+
+app.get('/v3/external/content', async (request, reply) => {
+  if (!(await requireApplicationApiKey(request, reply, 'content:read'))) return;
+  return { content: await readAppContent(true) };
+});
+
+app.get('/v3/external/diagnostics', async (request, reply) => {
+  if (!(await requireApplicationApiKey(request, reply, 'diagnostics:read'))) return;
+  await db.query('SELECT 1');
+  return { status: 'ok', database: 'ok', apiVersion: 'v3', checkedAt: new Date().toISOString() };
+});
 
 app.get('/v3/admin/app-content', async (request, reply) => {
   if (!(await requirePermission(request, reply, 'content:read'))) return;

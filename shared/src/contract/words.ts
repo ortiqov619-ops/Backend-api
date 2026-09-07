@@ -29,6 +29,7 @@ export interface Word extends Auditable {
   regionId?: Uuid | null;
   districtId?: Uuid | null;
   villageId?: Uuid | null;
+  neighborhoodId?: Uuid | null;
   dialectId?: Uuid | null;
   clan?: string | null;
   variants?: WordVariant[];
@@ -88,6 +89,8 @@ export interface CreateAdminWordRequest {
   category?: string | null;
   regionId?: Uuid | null;
   districtId?: Uuid | null;
+  villageId?: Uuid | null;
+  neighborhoodId?: Uuid | null;
   dialectId?: Uuid | null;
   /** Audit uchun majburiy: nima sababdan bevosita kiritildi. */
   changeReason: string;
@@ -108,6 +111,7 @@ export interface UpdateWordRequest {
   regionId?: Uuid | null;
   districtId?: Uuid | null;
   villageId?: Uuid | null;
+  neighborhoodId?: Uuid | null;
   dialectId?: Uuid | null;
   clan?: string | null;
   status?: WordStatus;

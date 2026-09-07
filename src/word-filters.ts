@@ -97,9 +97,9 @@ export function buildWordListFilters(
   if (regionId) {
     if (!UUID_PATTERN.test(regionId)) throw new WordFilterValidationError('Hudud identifikatori noto‘g‘ri.', 'regionId');
     params.push(regionId);
-    // Hudud bo'yicha qidiruv ierarxiyaning uch pog'onasini ham qamraydi:
+    // Hudud bo'yicha qidiruv ierarxiyaning to'rt pog'onasini ham qamraydi:
     // viloyat tanlansa uning tumanidagi so'zlar ham chiqishi kerak.
-    where.push(`(w.region_id = $${params.length} OR w.district_id = $${params.length} OR w.village_id = $${params.length})`);
+    where.push(`(w.region_id = $${params.length} OR w.district_id = $${params.length} OR w.village_id = $${params.length} OR w.neighborhood_id = $${params.length})`);
   }
 
   const dialectId = trimmed(query.dialectId);

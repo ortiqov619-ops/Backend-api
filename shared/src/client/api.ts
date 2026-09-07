@@ -1,4 +1,13 @@
 import type {
+  ApplicationApiKeyListQuery,
+  ApplicationApiKeyListResponse,
+  ApplicationApiKeySecretResponse,
+  CreateApplicationApiKeyRequest,
+  RevokeApplicationApiKeyRequest,
+  RevokeApplicationApiKeyResponse,
+  RotateApplicationApiKeyRequest,
+} from '../contract/applicationApiKeys';
+import type {
   AppContentResponse,
   UpdateAppContentRequest,
   UpdateAppContentResponse,
@@ -286,6 +295,22 @@ export class XorazmApiClient {
 
   auditLogs(query?: AuditLogQuery): Promise<AuditLogResponse> {
     return this.http.request('GET', '/admin/audit-logs', { query: toQuery(query) });
+  }
+
+  listApplicationApiKeys(query?: ApplicationApiKeyListQuery): Promise<ApplicationApiKeyListResponse> {
+    return this.http.request('GET', '/admin/api-keys', { query: toQuery(query) });
+  }
+
+  createApplicationApiKey(body: CreateApplicationApiKeyRequest): Promise<ApplicationApiKeySecretResponse> {
+    return this.http.request('POST', '/admin/api-keys', { body });
+  }
+
+  rotateApplicationApiKey(id: Uuid, body: RotateApplicationApiKeyRequest): Promise<ApplicationApiKeySecretResponse> {
+    return this.http.request('POST', `/admin/api-keys/${id}/rotate`, { body });
+  }
+
+  revokeApplicationApiKey(id: Uuid, body: RevokeApplicationApiKeyRequest): Promise<RevokeApplicationApiKeyResponse> {
+    return this.http.request('POST', `/admin/api-keys/${id}/revoke`, { body });
   }
 
   /* --------------------------- ilova matni --------------------------- */

@@ -12,6 +12,7 @@ export interface NormalizedRegionSuggestion {
 export interface RegionPublicationResolution {
   districtId: string | null;
   villageId: string | null;
+  neighborhoodId: string | null;
   neighborhood: string | null;
   matchedRegionId: string | null;
   resolution: 'canonical' | 'generalized';
@@ -139,6 +140,14 @@ export function isDirectVillageChild(
   return Boolean(village && districtId && village.level === 'village' && village.parentId === districtId);
 }
 
+/** Mahalla tanlangan qishloqning, u bo'lmasa tumanning bevosita farzandi bo'lishi shart. */
+export function isDirectNeighborhoodChild(
+  neighborhood: { level: string; parentId: string | null } | null,
+  parentId: string | null,
+): boolean {
+  return Boolean(neighborhood && parentId && neighborhood.level === 'neighborhood' && neighborhood.parentId === parentId);
+}
+
 /** Eski mobil versiyalardagi `dialectId: "Og‘uz"` matnini canonical UUIDga moslash uchun. */
 export function normalizeDialectLabel(value: string): string {
   return value
@@ -172,22 +181,25 @@ export function resolveRegionForPublication(
   explicitSelection: {
     districtId?: string | null;
     villageId?: string | null;
+    neighborhoodId?: string | null;
     neighborhood?: string | null;
   },
 ): RegionPublicationResolution {
   const districtId = explicitSelection.districtId ?? null;
   const villageId = explicitSelection.villageId ?? null;
+  const neighborhoodId = explicitSelection.neighborhoodId ?? null;
   const neighborhood = explicitSelection.neighborhood?.trim() || null;
   const exactId = suggestion.level === 'district'
     ? districtId
     : suggestion.level === 'village'
       ? villageId
-      : null;
-  const canonical = Boolean(exactId || (suggestion.level === 'neighborhood' && neighborhood));
+      : neighborhoodId;
+  const canonical = Boolean(exactId);
 
   return {
     districtId,
     villageId,
+    neighborhoodId,
     neighborhood,
     matchedRegionId: exactId,
     resolution: canonical ? 'canonical' : 'generalized',

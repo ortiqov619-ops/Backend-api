@@ -21,6 +21,7 @@ export * from './contract/community';
 export * from './contract/notifications';
 export * from './contract/appUpdates';
 export * from './contract/appContent';
+export * from './contract/applicationApiKeys';
 export * from './updates/policy';
 export * from './launch/intro';
 
@@ -37,6 +38,7 @@ export * from './validation/audio';
 export * from './text/script';
 
 export * from './client/http';
+export * from './client/pagination';
 export * from './client/api';
 
 export const SHARED_CONTRACT_VERSION = '3.0.0';
