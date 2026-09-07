@@ -44,10 +44,25 @@ export const config = {
   releaseToken: process.env.RELEASE_TOKEN,
   /** FCM service account (xom JSON yoki base64). Bo'sh bo'lsa push o'chirilgan. */
   firebaseServiceAccount: process.env.FIREBASE_SERVICE_ACCOUNT,
-  /** APK fayllari saqlanadigan katalog. Renderda doimiy diskda bo'lishi shart. */
+  /**
+   * ESKI relizlar uchun disk katalogi.
+   *
+   * Yangi relizlar bu yerga YOZILMAYDI — artefakt PostgreSQL da
+   * saqlanadi (`release-storage.ts`), chunki bu xizmat Render'ning
+   * bepul tarifida ishlaydi va u yerda doimiy disk yo'q. Bu qiymat
+   * faqat migratsiyadan oldin diskka yozilgan fayllarni o'qish uchun
+   * qoladi.
+   */
   apkDir: process.env.APK_UPLOAD_DIR ?? './var/apk',
-  /** Har bir ilova turi uchun diskda saqlanadigan reliz soni. */
-  apkRetention: Math.max(1, Number(process.env.APK_RETENTION ?? 5)),
+  /**
+   * Har bir ilova turi uchun saqlanadigan reliz soni.
+   *
+   * Artefakt endi bazada, ya'ni u audio bilan bitta 1 GB lik
+   * chegarani bo'lishadi. Bitta APK ~35 MB: 3 ta reliz × 2 ilova
+   * ≈ 210 MB. Bu orqaga qaytish (rollback) uchun yetarli va bazani
+   * to'ldirib qo'ymaydi. Obyekt xotirasiga o'tilganda oshirsa bo'ladi.
+   */
+  apkRetention: Math.max(1, Number(process.env.APK_RETENTION ?? 3)),
   /**
    * APK yuklab olish manzilining ochiq bazasi.
    *

@@ -87,6 +87,12 @@ import {
   UPDATE_TYPES,
 } from './app-releases';
 import { parseServiceAccount, sendUpdateToTopic } from './fcm';
+import {
+  deleteLegacyArtifact,
+  deleteReleaseArtifact,
+  getReleaseArtifact,
+  putReleaseArtifact,
+} from './release-storage';
 import { AppContentValidationError, parseAppContentUpdate } from './app-content';
 import { submitterDisplayName } from './guest-identity';
 import { blockedMessage, decideContributionAccess } from './contribution-access';
@@ -3623,33 +3629,30 @@ app.get('/v3/app-updates/download/:appType/:file', async (request, reply) => {
   }
   const versionCode = Number(match[1]);
   const found = await db.query(
-    `SELECT storage_key, file_size FROM app_releases
-      WHERE app_type=$1::app_type AND platform='ANDROID' AND version_code=$2 AND storage_key IS NOT NULL`,
+    `SELECT id, storage_key FROM app_releases
+      WHERE app_type=$1::app_type AND platform='ANDROID' AND version_code=$2`,
     [appType, versionCode],
   );
   const row = found.rows[0];
   if (!row) return apiError(reply, 404, 'not_found', 'Reliz topilmadi.');
 
-  // Kalit bazadan kelsa ham yo'l tekshiriladi: saqlash katalogidan
-  // tashqariga chiqadigan kalit hech qachon o'qilmasligi kerak.
-  const root = resolve(config.apkDir);
-  const apkPath = resolve(root, String(row.storage_key));
-  if (apkPath !== root && !apkPath.startsWith(`${root}${sep}`)) {
-    return apiError(reply, 404, 'not_found', 'Reliz topilmadi.');
-  }
-  try {
-    const apk = await readFile(apkPath);
-    return reply
-      .type('application/vnd.android.package-archive')
-      // Reliz fayli o'zgarmaydi, shuning uchun uzoq keshlanadi.
-      .header('Cache-Control', 'public, max-age=604800, immutable')
-      .header('Content-Length', String(apk.length))
-      .header('Content-Disposition', `attachment; filename="${apkFileName(appType, versionCode)}"`)
-      .send(apk);
-  } catch {
-    app.log.error({ appType, versionCode }, 'Reliz APK fayli diskda topilmadi');
+  // Avval baza, so'ng eski disk. Saqlash joyi `release-storage.ts` da
+  // jamlangan — bu yerda uning ichki tuzilishi bilinmaydi.
+  const apk = await getReleaseArtifact(db, String(row.id), {
+    apkDir: config.apkDir,
+    storageKey: nullableString(row.storage_key),
+  });
+  if (!apk) {
+    app.log.error({ appType, versionCode }, 'Reliz artefakti topilmadi');
     return apiError(reply, 404, 'not_found', 'Reliz fayli topilmadi.');
   }
+  return reply
+    .type('application/vnd.android.package-archive')
+    // Reliz fayli o'zgarmaydi, shuning uchun uzoq keshlanadi.
+    .header('Cache-Control', 'public, max-age=604800, immutable')
+    .header('Content-Length', String(apk.length))
+    .header('Content-Disposition', `attachment; filename="${apkFileName(appType, versionCode)}"`)
+    .send(apk);
 });
 
 /**
@@ -3715,9 +3718,10 @@ app.post('/v3/internal/releases/publish', async (request, reply) => {
     }
     sha256 = actual;
     fileSize = apk.length;
+    // `storage_key` endi diskka emas, artefakt bazada ekaniga ishora
+    // qiladi: u yuklab olish yo'lini tanlash uchun emas, faqat eski
+    // yozuvlar bilan moslik uchun saqlanadi.
     storageKey = apkFileName(parsed.appType, parsed.versionCode);
-    await mkdir(resolve(config.apkDir), { recursive: true });
-    await writeFile(resolve(config.apkDir, storageKey), apk);
     downloadUrl = downloadUrlFor(parsed.appType, parsed.versionCode);
   }
 
@@ -3748,6 +3752,13 @@ app.post('/v3/internal/releases/publish', async (request, reply) => {
         downloadUrl, storageKey, fileSize, sha256, jsonb(parsed.releaseNotes),
       ],
     );
+    // Artefakt reliz yozuvi bilan BIR TRANZAKSIYADA saqlanadi va darhol
+    // qayta o'qib tekshiriladi. Shu sabab "yozuv bor, fayl yo'q"
+    // holati — ya'ni foydalanuvchiga o'lik yangilanish ko'rsatilishi —
+    // umuman yuzaga kelmaydi.
+    if (apk && sha256) {
+      await putReleaseArtifact(client, String(saved.rows[0].id), apk, sha256);
+    }
     await audit(null, 'release.publish', 'app_release', String(saved.rows[0].id), 'CI reliz', {
       appType: parsed.appType,
       platform: parsed.platform,
@@ -3790,19 +3801,25 @@ app.post('/v3/internal/releases/publish', async (request, reply) => {
  * Baza yozuvi o'chirilmaydi — faqat fayl.
  */
 async function pruneOldApks(appType: string): Promise<void> {
+  // Eng yangi `apkRetention` ta reliz saqlanadi. Tartib `version_code`
+  // bo'yicha kamayish tartibida, ya'ni birinchi qator — aynan hozir
+  // tarqatilayotgan reliz va u hech qachon OFFSET ostiga tushmaydi.
   const stale = await db.query(
     `SELECT id, storage_key FROM app_releases
-      WHERE app_type=$1::app_type AND platform='ANDROID' AND storage_key IS NOT NULL
+      WHERE app_type=$1::app_type AND platform='ANDROID'
       ORDER BY version_code DESC OFFSET $2`,
-    [appType, config.apkRetention],
+    [appType, Math.max(1, config.apkRetention)],
   );
   for (const row of stale.rows) {
-    const root = resolve(config.apkDir);
-    const target = resolve(root, String(row.storage_key));
-    if (target !== root && target.startsWith(`${root}${sep}`)) {
-      await unlink(target).catch(() => undefined);
-    }
-    await db.query('UPDATE app_releases SET storage_key=NULL WHERE id=$1', [row.id]);
+    // Artefakt o'chadi, reliz yozuvi tarixda qoladi. `is_active=false`
+    // qilinadi, aks holda `app_releases_android_artifact` sharti
+    // buzilgan holatda faol reliz qolib ketardi.
+    await deleteReleaseArtifact(db, String(row.id));
+    await deleteLegacyArtifact(config.apkDir, nullableString(row.storage_key));
+    await db.query(
+      'UPDATE app_releases SET storage_key=NULL, is_active=false WHERE id=$1',
+      [row.id],
+    );
   }
 }
 
