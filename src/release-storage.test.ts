@@ -4,12 +4,14 @@ import { randomBytes } from 'node:crypto';
 import { Pool, type PoolClient } from 'pg';
 import { APP_TYPES } from './app-releases';
 import {
+  ARTIFACT_CHUNK_BYTES,
   deleteReleaseArtifact,
-  getReleaseArtifact,
+  getReleaseArtifactMeta,
   putReleaseArtifact,
   releaseArtifactExists,
   safeLegacyPath,
   sha256Of,
+  streamReleaseArtifact,
 } from './release-storage';
 
 // ---------------------------------------------------------------------------
@@ -57,6 +59,13 @@ async function inRollback(run: (client: PoolClient) => Promise<void>): Promise<v
   }
 }
 
+/** Oqimni to'liq o'qib, baytlarni qaytaradi. */
+async function collectStream(stream: NodeJS.ReadableStream): Promise<Buffer> {
+  const parts: Buffer[] = [];
+  for await (const chunk of stream) parts.push(Buffer.from(chunk as Buffer));
+  return Buffer.concat(parts);
+}
+
 /** Test relizi. `version_code` to'qnashmasligi uchun yuqori diapazon. */
 async function createRelease(client: PoolClient, appType: 'USER' | 'ADMIN', versionCode: number) {
   const created = await client.query<{ id: string }>(
@@ -76,10 +85,12 @@ test('artefakt saqlanadi va aynan o‘sha baytlar qaytadi', needsDatabase, async
     await putReleaseArtifact(client, id, bytes, sha256Of(bytes));
 
     assert.equal(await releaseArtifactExists(client, id), true);
-    const read = await getReleaseArtifact(client, id, { apkDir: '/tmp/nonexistent', storageKey: null });
-    assert.ok(read, 'artefakt qaytmadi');
-    assert.equal(read!.length, bytes.length);
-    assert.equal(sha256Of(read!), sha256Of(bytes), 'baytlar o‘zgargan');
+    const meta = await getReleaseArtifactMeta(client, id);
+    assert.equal(meta!.sizeBytes, bytes.length);
+    assert.equal(meta!.sha256, sha256Of(bytes));
+    const read = await collectStream(streamReleaseArtifact(client, id));
+    assert.equal(read.length, bytes.length);
+    assert.equal(sha256Of(read), sha256Of(bytes), 'baytlar o‘zgargan');
   });
 });
 
@@ -99,7 +110,8 @@ test('artefakt yo‘q bo‘lsa null qaytadi — 500 emas', needsDatabase, async 
   await inRollback(async (client) => {
     const id = await createRelease(client, 'ADMIN', 900003);
     assert.equal(await releaseArtifactExists(client, id), false);
-    assert.equal(await getReleaseArtifact(client, id, { apkDir: '/tmp/nonexistent', storageKey: null }), null);
+    assert.equal(await getReleaseArtifactMeta(client, id), null);
+    assert.equal((await collectStream(streamReleaseArtifact(client, id))).length, 0);
   });
 });
 
@@ -115,8 +127,8 @@ test('qayta yuklash artefaktni almashtiradi, dublikat yaratmaydi', needsDatabase
       'SELECT count(*)::int AS total FROM app_release_artifacts WHERE release_id = $1::uuid', [id],
     );
     assert.equal(rows.rows[0]!.total, 1);
-    const read = await getReleaseArtifact(client, id, { apkDir: '/tmp/nonexistent', storageKey: null });
-    assert.equal(sha256Of(read!), sha256Of(second));
+    const read = await collectStream(streamReleaseArtifact(client, id));
+    assert.equal(sha256Of(read), sha256Of(second));
   });
 });
 
@@ -126,10 +138,12 @@ test('artefakt reliz yozuvi bilan birga o‘chadi', needsDatabase, async () => {
     const bytes = randomBytes(128);
     await putReleaseArtifact(client, id, bytes, sha256Of(bytes));
     await client.query('DELETE FROM app_releases WHERE id = $1::uuid', [id]);
-    const rows = await client.query<{ total: number }>(
-      'SELECT count(*)::int AS total FROM app_release_artifacts WHERE release_id = $1::uuid', [id],
-    );
-    assert.equal(rows.rows[0]!.total, 0, 'CASCADE ishlamadi — yetim artefakt qoldi');
+    for (const table of ['app_release_artifacts', 'app_release_artifact_chunks']) {
+      const rows = await client.query<{ total: number }>(
+        `SELECT count(*)::int AS total FROM ${table} WHERE release_id = $1::uuid`, [id],
+      );
+      assert.equal(rows.rows[0]!.total, 0, `CASCADE ishlamadi: ${table}`);
+    }
   });
 });
 
@@ -175,4 +189,43 @@ test('USER va ADMIN retention bir-biriga aralashmaydi', needsDatabase, async () 
     );
     assert.ok(!stale.rows.some((row) => row.id === userId), 'ADMIN tozalashi USER relizini tanladi');
   });
+});
+
+test('katta artefakt bir nechta bo‘lakka bo‘linadi', needsDatabase, async () => {
+  await inRollback(async (client) => {
+    const id = await createRelease(client, 'USER', 900030);
+    // Ikki bo'lakdan sal ko'proq — chegaradagi holat.
+    const bytes = randomBytes(ARTIFACT_CHUNK_BYTES * 2 + 1024);
+    await putReleaseArtifact(client, id, bytes, sha256Of(bytes));
+
+    const chunks = await client.query<{ total: number }>(
+      'SELECT count(*)::int AS total FROM app_release_artifact_chunks WHERE release_id = $1::uuid', [id],
+    );
+    assert.equal(chunks.rows[0]!.total, 3, 'bo‘laklar soni kutilganidek emas');
+
+    const read = await collectStream(streamReleaseArtifact(client, id));
+    assert.equal(read.length, bytes.length);
+    assert.equal(sha256Of(read), sha256Of(bytes), 'bo‘laklardan yig‘ilgan fayl buzilgan');
+  });
+});
+
+test('kichikroq fayl qayta yuklanganda eski bo‘laklar qolmaydi', needsDatabase, async () => {
+  await inRollback(async (client) => {
+    const id = await createRelease(client, 'USER', 900031);
+    const big = randomBytes(ARTIFACT_CHUNK_BYTES * 2);
+    await putReleaseArtifact(client, id, big, sha256Of(big));
+    const small = randomBytes(1024);
+    await putReleaseArtifact(client, id, small, sha256Of(small));
+
+    const read = await collectStream(streamReleaseArtifact(client, id));
+    assert.equal(read.length, small.length, 'eski bo‘laklar qolib, fayl uzayib ketdi');
+    assert.equal(sha256Of(read), sha256Of(small));
+  });
+});
+
+test('bo‘lak hajmi xotira uchun xavfsiz chegarada', () => {
+  // `bytea` sim orqali o'n oltilik matn sifatida ketadi — hajm
+  // ikkilanadi. 512 MB lik instansiya uchun 4 MB xavfsiz.
+  assert.ok(ARTIFACT_CHUNK_BYTES <= 8 * 1024 * 1024, 'bo‘lak juda katta');
+  assert.ok(ARTIFACT_CHUNK_BYTES >= 1024 * 1024, 'bo‘lak juda kichik — so‘rovlar ko‘payadi');
 });

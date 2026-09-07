@@ -90,8 +90,10 @@ import { parseServiceAccount, sendUpdateToTopic } from './fcm';
 import {
   deleteLegacyArtifact,
   deleteReleaseArtifact,
-  getReleaseArtifact,
+  getReleaseArtifactMeta,
   putReleaseArtifact,
+  readLegacyArtifact,
+  streamReleaseArtifact,
 } from './release-storage';
 import { AppContentValidationError, parseAppContentUpdate } from './app-content';
 import { submitterDisplayName } from './guest-identity';
@@ -3636,23 +3638,27 @@ app.get('/v3/app-updates/download/:appType/:file', async (request, reply) => {
   const row = found.rows[0];
   if (!row) return apiError(reply, 404, 'not_found', 'Reliz topilmadi.');
 
-  // Avval baza, so'ng eski disk. Saqlash joyi `release-storage.ts` da
-  // jamlangan — bu yerda uning ichki tuzilishi bilinmaydi.
-  const apk = await getReleaseArtifact(db, String(row.id), {
-    apkDir: config.apkDir,
-    storageKey: nullableString(row.storage_key),
-  });
-  if (!apk) {
-    app.log.error({ appType, versionCode }, 'Reliz artefakti topilmadi');
-    return apiError(reply, 404, 'not_found', 'Reliz fayli topilmadi.');
-  }
-  return reply
+  const headers = (length: number) => reply
     .type('application/vnd.android.package-archive')
     // Reliz fayli o'zgarmaydi, shuning uchun uzoq keshlanadi.
     .header('Cache-Control', 'public, max-age=604800, immutable')
-    .header('Content-Length', String(apk.length))
-    .header('Content-Disposition', `attachment; filename="${apkFileName(appType, versionCode)}"`)
-    .send(apk);
+    .header('Content-Length', String(length))
+    .header('Content-Disposition', `attachment; filename="${apkFileName(appType, versionCode)}"`);
+
+  // Avval baza. Artefakt bo'lak-bo'lak uzatiladi: 37 MB lik faylni
+  // xotiraga yig'ish 512 MB lik instansiyani yiqitardi.
+  const meta = await getReleaseArtifactMeta(db, String(row.id));
+  if (meta) {
+    return headers(meta.sizeBytes).send(streamReleaseArtifact(db, String(row.id)));
+  }
+
+  // Eski, diskka yozilgan relizlar — konteyner almashtirilmagunicha.
+  const legacy = await readLegacyArtifact(config.apkDir, nullableString(row.storage_key));
+  if (!legacy) {
+    app.log.error({ appType, versionCode }, 'Reliz artefakti topilmadi');
+    return apiError(reply, 404, 'not_found', 'Reliz fayli topilmadi.');
+  }
+  return headers(legacy.length).send(legacy);
 });
 
 /**
