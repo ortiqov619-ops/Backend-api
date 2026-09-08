@@ -21,6 +21,7 @@ export * from './contract/community';
 export * from './contract/notifications';
 export * from './contract/appUpdates';
 export * from './contract/appContent';
+export * from './contract/contributionRules';
 export * from './contract/applicationApiKeys';
 export * from './updates/policy';
 export * from './launch/intro';

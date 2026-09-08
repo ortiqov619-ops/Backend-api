@@ -99,6 +99,13 @@ import {
   streamReleaseArtifact,
 } from './release-storage';
 import { AppContentValidationError, parseAppContentUpdate } from './app-content';
+import {
+  CONTRIBUTION_RULE_FIELDS,
+  CONTRIBUTION_RULE_LABELS,
+  missingRequiredContributionFields,
+  parseContributionFieldRules,
+  type ContributionFieldRules,
+} from '@xorazm/shared';
 import { decideAdminAccess } from './admin-access';
 import { submitterDisplayName } from './guest-identity';
 import { blockedMessage, decideContributionAccess } from './contribution-access';
@@ -2180,6 +2187,26 @@ app.post('/v3/contributions/words', async (request, reply) => {
   const body = asObject(request.body); const payload = asObject(body.payload); const location = asObject(body.location); const device = asObject(body.device); const key = asString(body.idempotencyKey);
   if (!asString(payload.word) || !asString(payload.meaning) || !key) return apiError(reply, 422, 'validation_failed', 'So‘z, ma’no va idempotency kaliti majburiy.');
   const existing = await db.query(`${requestSql} WHERE cr.idempotency_key=$1`, [key]); if (existing.rows[0]) return { request: await mapRequest(existing.rows[0]), userMessage: 'Avvalgi so‘rov qaytarildi.' };
+
+  /**
+   * Loyiha egasi majburiy qilib belgilagan maydonlar.
+   *
+   * `audio` bu yerda tekshirilmaydi: u so'z yozuvi yaratilgandan keyin
+   * alohida so'rovda keladi, ya'ni hozir uni talab qilish so'zning
+   * o'zini rad etishga olib kelardi. Uni ilova formasi to'sadi.
+   */
+  const { rules: fieldRules } = await readContributionFieldRules();
+  const missingFields = missingRequiredContributionFields(fieldRules, {
+    clan: asString(payload.clan),
+    dialectId: asString(payload.dialectId),
+  }, { hasAudio: true });
+  if (missingFields.length) {
+    return apiError(
+      reply, 422, 'validation_failed',
+      `Quyidagi maydonlar majburiy: ${missingFields.map((field) => CONTRIBUTION_RULE_LABELS[field]).join(', ')}.`,
+      Object.fromEntries(missingFields.map((field) => [`payload.${field}`, [`${CONTRIBUTION_RULE_LABELS[field]} majburiy.`]])),
+    );
+  }
   /**
    * Hissa qo'shish hisobsiz ham mumkin.
    *
@@ -3221,6 +3248,68 @@ app.get('/v3/external/diagnostics', async (request, reply) => {
   if (!(await requireApplicationApiKey(request, reply, 'diagnostics:read'))) return;
   await db.query('SELECT 1');
   return { status: 'ok', database: 'ok', apiVersion: 'v3', checkedAt: new Date().toISOString() };
+});
+
+/**
+ * Hissa formasidagi maydon talablari.
+ *
+ * Jadval bo'sh yoki yetib bo'lmaydigan bo'lsa sukut qiymat qaytadi
+ * (hech biri majburiy emas): noma'lum sababga ko'ra formani bloklab
+ * qo'yishdan ko'ra uni ochiq qoldirish kamroq zarar qiladi.
+ */
+async function readContributionFieldRules(): Promise<{ rules: ContributionFieldRules; updatedAt: string | null }> {
+  const rows = await db.query('SELECT field, is_required, updated_at FROM contribution_field_rules');
+  const raw: Record<string, boolean> = {};
+  let updatedAt: Date | null = null;
+  for (const row of rows.rows) {
+    raw[String(row.field)] = Boolean(row.is_required);
+    const changed = row.updated_at ? new Date(String(row.updated_at)) : null;
+    if (changed && (!updatedAt || changed > updatedAt)) updatedAt = changed;
+  }
+  return { rules: parseContributionFieldRules(raw), updatedAt: updatedAt ? updatedAt.toISOString() : null };
+}
+
+app.get('/v3/app/contribution-rules', async (_request, reply) => {
+  // Ilova buni forma chizilishidan oldin so'raydi, shuning uchun
+  // javob qisqa muddat keshlanadi.
+  reply.header('Cache-Control', 'public, max-age=60');
+  return await readContributionFieldRules();
+});
+
+app.get('/v3/admin/contribution-rules', async (request, reply) => {
+  if (!(await requirePermission(request, reply, 'content:read'))) return;
+  return await readContributionFieldRules();
+});
+
+app.put('/v3/admin/contribution-rules', async (request, reply) => {
+  const claims = await requirePermission(request, reply, 'content:write'); if (!claims) return;
+  const body = asObject(request.body);
+  const reason = asString(body.changeReason);
+  if (!reason) return apiError(reply, 422, 'validation_failed', 'O‘zgarish sababi majburiy.', { changeReason: ['Sababni yozing.'] });
+
+  // Noma'lum kalitlar tashlanadi: jadvalga faqat ro'yxatdagi maydon tushadi.
+  const requested = parseContributionFieldRules(body.rules);
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    for (const field of CONTRIBUTION_RULE_FIELDS) {
+      await client.query(
+        `INSERT INTO contribution_field_rules (field, is_required, updated_at, updated_by)
+         VALUES ($1, $2, now(), $3::uuid)
+         ON CONFLICT (field) DO UPDATE
+           SET is_required = EXCLUDED.is_required, updated_at = now(), updated_by = EXCLUDED.updated_by`,
+        [field, requested[field], claims.sub],
+      );
+    }
+    await audit(claims, 'content.update', 'app_content', 'contribution_field_rules', reason, requested as unknown as Json, request, client);
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    return failFromError(reply, error, 'contribution_rules.update');
+  } finally {
+    client.release();
+  }
+  return await readContributionFieldRules();
 });
 
 app.get('/v3/admin/app-content', async (request, reply) => {
