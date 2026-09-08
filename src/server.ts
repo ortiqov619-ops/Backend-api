@@ -99,6 +99,7 @@ import {
   streamReleaseArtifact,
 } from './release-storage';
 import { AppContentValidationError, parseAppContentUpdate } from './app-content';
+import { decideAdminAccess } from './admin-access';
 import { submitterDisplayName } from './guest-identity';
 import { blockedMessage, decideContributionAccess } from './contribution-access';
 import { buildWordListFilters, WordFilterValidationError } from './word-filters';
@@ -330,10 +331,41 @@ async function claimsFor(request: FastifyRequest, permission?: string): Promise<
     return claims;
   } catch { return null; }
 }
+/**
+ * Admin endpointi uchun ruxsat.
+ *
+ * TOKEN holati va RUXSAT holati ataylab ajratilgan.
+ *
+ * Ilgari ikkalasi ham `claimsFor` dan `null` qaytarardi va javob
+ * `Authorization` sarlavhasi bor-yo'qligiga qarab tanlanardi. Natijada
+ * MUDDATI O'TGAN token 403 olardi, 401 emas. Mijoz esa tokenni faqat
+ * 401 da yangilaydi (`TokenProvider.onUnauthorized`), shuning uchun
+ * access token muddati (15 daqiqa) tugagach admin panelda har qanday
+ * amal «Bu amal uchun ruxsatingiz yo'q» xatosini berardi va boshqaruv
+ * ekranlari «Xatolik» ko'rsatardi. Ilova qayta ochilmaguncha tuzalmasdi.
+ *
+ * `requireAppUser` mobil tomonda buni allaqachon to'g'ri qilardi —
+ * shuning uchun nosozlik faqat admin ilovasida ko'rinardi.
+ */
 async function requirePermission(request: FastifyRequest, reply: FastifyReply, permission: string): Promise<Claims | null> {
-  const claims = await claimsFor(request, permission);
-  if (!claims) {
-    apiError(reply, request.headers.authorization ? 403 : 401, request.headers.authorization ? 'forbidden' : 'unauthorized', request.headers.authorization ? 'Bu amal uchun ruxsat yo‘q.' : 'Avval tizimga kiring.');
+  const authorization = request.headers.authorization;
+  const hasBearer = Boolean(authorization?.startsWith('Bearer '));
+  let claims: Claims | null = null;
+  if (hasBearer) {
+    try {
+      claims = await verifyAccessToken(authorization!.slice(7));
+    } catch {
+      claims = null;
+    }
+  }
+  const decision = decideAdminAccess({
+    hasBearer,
+    tokenValid: claims !== null,
+    permissions: claims?.permissions ?? [],
+    required: permission,
+  });
+  if (!decision.allowed) {
+    apiError(reply, decision.status, decision.code, decision.message);
     return null;
   }
   return claims;
