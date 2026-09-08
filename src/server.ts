@@ -82,6 +82,7 @@ import {
   parseReleaseInput,
   PLATFORMS,
   ReleaseValidationError,
+  resolveDownloadUrl,
   updateNotificationText,
   updateTopic,
   UPDATE_TYPES,
@@ -3472,13 +3473,34 @@ function mapRelease(row: QueryResultRow) {
   };
 }
 
+/**
+ * Yangilanish tekshiruvi qaytaradigan ko'rinish.
+ *
+ * `downloadUrl` yozuvdan EMAS, hozirgi sozlamadan quriladi (agar fayl
+ * bizda saqlansa). Sabab: yozuvdagi mutlaq havola nashr paytidagi
+ * hostni abadiy muhrlab qo'yadi. Host o'zgarsa yoki oldiga CDN
+ * qo'yilsa, eski relizlarning havolasi o'lik qolardi va ilova
+ * "yuklab bo'lmadi" xatosini berardi — buni tuzatish uchun har bir
+ * eski relizni qayta nashr qilishga to'g'ri kelardi.
+ *
+ * `storage_key` bo'sh bo'lsa fayl bizniki emas (tashqi havola bilan
+ * nashr qilingan reliz) — u holda yozuvdagi havola o'zgarishsiz
+ * qaytariladi.
+ */
 function releaseViewFrom(row: QueryResultRow) {
+  const storageKey = nullableString(row.storage_key);
   return {
     versionName: String(row.version_name),
     versionCode: Number(row.version_code),
     minimumSupportedVersionCode: Number(row.minimum_supported_version_code),
     updateType: row.update_type as 'OPTIONAL' | 'RECOMMENDED' | 'REQUIRED',
-    downloadUrl: (row.download_url as string | null) ?? null,
+    downloadUrl: resolveDownloadUrl({
+      baseUrl: config.publicDownloadBaseUrl || config.publicBaseUrl,
+      appType: String(row.app_type),
+      versionCode: Number(row.version_code),
+      storageKey,
+      storedUrl: (row.download_url as string | null) ?? null,
+    }),
     fileSize: row.file_size === null || row.file_size === undefined ? null : Number(row.file_size),
     sha256: (row.sha256 as string | null) ?? null,
     releaseNotes: (row.release_notes as string[] | null) ?? [],

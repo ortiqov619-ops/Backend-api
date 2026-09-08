@@ -226,3 +226,27 @@ export function updateNotificationText(appType: AppType, versionName: string): {
 export function updateTopic(appType: AppType, platform: AppPlatform): string {
   return `xorazim-${appType.toLowerCase()}-${platform.toLowerCase()}`;
 }
+
+/**
+ * Reliz APK'sining ommaviy havolasi.
+ *
+ * Havola nashr paytida yozuvga muhrlanmasligi kerak: xizmat hosti
+ * o'zgarsa yoki oldiga CDN qo'yilsa, eski relizlarning havolasi o'lik
+ * qolardi. Shuning uchun fayl bizda saqlansa (`storageKey` bor) havola
+ * har safar HOZIRGI sozlamadan quriladi.
+ *
+ * `storageKey` bo'sh bo'lsa fayl bizniki emas — tashqi havola bilan
+ * nashr qilingan reliz o'z havolasini saqlab qoladi.
+ */
+export function resolveDownloadUrl(input: {
+  baseUrl: string;
+  appType: string;
+  versionCode: number;
+  storageKey: string | null;
+  storedUrl: string | null;
+}): string | null {
+  if (!input.storageKey) return input.storedUrl;
+  const base = input.baseUrl.replace(/\/+$/, '');
+  if (!base) return input.storedUrl;
+  return `${base}/v3/app-updates/download/${input.appType.toLowerCase()}/${input.versionCode}.apk`;
+}

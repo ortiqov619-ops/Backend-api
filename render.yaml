@@ -26,6 +26,19 @@ services:
         value: https://xorazm-shevalari-backend-api.onrender.com
       - key: TRUST_PROXY
         value: "true"
+      # APK yuklab olish havolasi Cloudflare Worker orqali beriladi.
+      #
+      # NEGA: ilova API uchun ham shu Worker'dan foydalanadi, chunki
+      # O'zbekistondan Render hostiga to'g'ridan-to'g'ri yo'l sekin.
+      # Havola Render hostiga ishora qilganda ilova yangilanishni
+      # topardi-yu, 37 MB lik faylni ola olmasdi. Worker esa faylni
+      # chekka keshdan beradi — tez va bepul tarifdagi origin'ni
+      # yuklamaydi.
+      #
+      # Bu qiymat FAQAT havola qurish uchun; fayl baribir shu
+      # xizmatning `/v3/app-updates/download/...` yo'lidan chiqadi.
+      - key: PUBLIC_DOWNLOAD_BASE_URL
+        value: https://xorazm-api.ortiqov619.workers.dev
       # Reliz APK'lari 0018 migratsiyasidan boshlab PostgreSQL da
       # saqlanadi (`app_release_artifacts`). Sabab: bepul tarifda
       # doimiy disk yo'q va konteyner fayl tizimi har redeployda

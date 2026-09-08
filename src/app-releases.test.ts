@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   decideUpdate,
+  resolveDownloadUrl,
   effectiveUpdateType,
   parseReleaseInput,
   ReleaseValidationError,
@@ -161,4 +162,52 @@ test('Android relizi checksumsiz nashr qilinmaydi', () => {
   assert.doesNotThrow(
     () => parseReleaseInput({ appType: 'USER', platform: 'IOS', versionName: '1.0.0', versionCode: 1 }, { requireArtifact: true }),
   );
+});
+
+// ---------------------------------------------------------------------------
+// Yuklab olish havolasi
+// ---------------------------------------------------------------------------
+
+const selfHosted = {
+  baseUrl: 'https://cdn.example.test',
+  appType: 'USER',
+  versionCode: 20,
+  storageKey: 'user-20.apk',
+  storedUrl: 'https://eski-host.example.test/v3/app-updates/download/user/20.apk',
+};
+
+test('o‘zimizda saqlanadigan relizning havolasi hozirgi sozlamadan quriladi', () => {
+  // Yozuvdagi eski host e'tiborga olinmaydi — aks holda host o'zgarganda
+  // barcha eski relizlarning havolasi o'lik qolardi.
+  assert.equal(
+    resolveDownloadUrl(selfHosted),
+    'https://cdn.example.test/v3/app-updates/download/user/20.apk',
+  );
+});
+
+test('havoladagi ortiqcha slash ikkilanmaydi', () => {
+  assert.equal(
+    resolveDownloadUrl({ ...selfHosted, baseUrl: 'https://cdn.example.test///' }),
+    'https://cdn.example.test/v3/app-updates/download/user/20.apk',
+  );
+});
+
+test('ADMIN va USER yo‘llari aralashmaydi', () => {
+  assert.equal(
+    resolveDownloadUrl({ ...selfHosted, appType: 'ADMIN', versionCode: 17, storageKey: 'admin-17.apk' }),
+    'https://cdn.example.test/v3/app-updates/download/admin/17.apk',
+  );
+});
+
+test('tashqi havola bilan nashr qilingan reliz o‘z havolasini saqlaydi', () => {
+  // Fayl bizda emas: uni qayta yozish relizni buzardi.
+  assert.equal(
+    resolveDownloadUrl({ ...selfHosted, storageKey: null }),
+    selfHosted.storedUrl,
+  );
+});
+
+test('base sozlanmagan bo‘lsa yozuvdagi havola saqlanadi', () => {
+  // Yarim havola qaytarishdan ko'ra eskisini berish xavfsizroq.
+  assert.equal(resolveDownloadUrl({ ...selfHosted, baseUrl: '' }), selfHosted.storedUrl);
 });
