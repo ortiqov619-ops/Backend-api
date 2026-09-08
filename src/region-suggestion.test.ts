@@ -153,3 +153,57 @@ test('maxLength maydonga qarab o‘zgaradi', () => {
     (error: unknown) => error instanceof RegionSuggestionValidationError && error.field === 'payload.clan',
   );
 });
+
+// ---------------------------------------------------------------------------
+// Davlat taklifi
+// ---------------------------------------------------------------------------
+
+test('davlat taklifining ota-hududi bo‘lmaydi', () => {
+  // Davlat ierarxiyaning tepasi: unga parent berib bo'lmaydi.
+  assert.deepEqual(parseRegionSuggestion({ nameUz: '  Turkmaniston  ', level: 'republic' }, XORAZM_ID), {
+    nameUz: 'Turkmaniston',
+    level: 'republic',
+    parentRegionId: null,
+  });
+});
+
+test('davlat taklifiga yuborilgan parentRegionId e’tiborga olinmaydi', () => {
+  // Aks holda davlat o'zidan kichik hududning ichiga tushib qolardi.
+  const parsed = parseRegionSuggestion(
+    { nameUz: 'Qozog‘iston', level: 'republic', parentRegionId: XORAZM_ID },
+    XORAZM_ID,
+  );
+  assert.equal(parsed?.parentRegionId, null);
+});
+
+test('davlat nomi ham qolgan hududlar bilan bir xil qat’iylikda tekshiriladi', () => {
+  for (const nameUz of ['T', 'boshqa', 'http://example.test', 'x'.repeat(81)]) {
+    assert.throws(
+      () => parseRegionSuggestion({ nameUz, level: 'republic' }, XORAZM_ID),
+      RegionSuggestionValidationError,
+      nameUz,
+    );
+  }
+});
+
+test('davlat taklifi so‘zni hech qanday tumanga bog‘lamaydi', () => {
+  // So'z tanlangan viloyatda qoladi; davlatni moderator alohida yaratadi.
+  const districtId = '10000000-0000-4000-8000-000000000002';
+  const resolved = resolveRegionForPublication(
+    { nameUz: 'Turkmaniston', level: 'republic', parentRegionId: null },
+    { districtId },
+  );
+  assert.equal(resolved.matchedRegionId, null, 'davlat tumanga bog‘lanib qoldi');
+  assert.equal(resolved.resolution, 'generalized');
+  // Moderator tanlagan tuman saqlanadi — so'z bir joyda nashr qilinishi kerak.
+  assert.equal(resolved.districtId, districtId);
+});
+
+test('boshqa darajalar davlat qo‘shilgandan keyin ham o‘zgarmaydi', () => {
+  // Regressiya: ishlab turgan tuman taklifi buzilmasligi shart.
+  assert.deepEqual(parseRegionSuggestion({ nameUz: 'Yangi tuman', level: 'district' }, XORAZM_ID), {
+    nameUz: 'Yangi tuman',
+    level: 'district',
+    parentRegionId: XORAZM_ID,
+  });
+});

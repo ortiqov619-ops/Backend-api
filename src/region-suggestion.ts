@@ -1,4 +1,11 @@
-export const PROPOSED_REGION_LEVELS = ['district', 'village', 'neighborhood'] as const;
+/**
+ * Foydalanuvchi taklif qila oladigan hudud darajalari.
+ *
+ * `republic` — davlat. U ierarxiyaning eng yuqori bo'g'ini, ya'ni
+ * ota-hududi yo'q; qolgan darajalar esa har doim mavjud hududning
+ * ichiga taklif qilinadi.
+ */
+export const PROPOSED_REGION_LEVELS = ['republic', 'district', 'village', 'neighborhood'] as const;
 
 export type ProposedRegionLevel = (typeof PROPOSED_REGION_LEVELS)[number];
 export type CanonicalRegionLevel = 'republic' | 'region' | ProposedRegionLevel;
@@ -6,7 +13,8 @@ export type CanonicalRegionLevel = 'republic' | 'region' | ProposedRegionLevel;
 export interface NormalizedRegionSuggestion {
   nameUz: string;
   level: ProposedRegionLevel;
-  parentRegionId: string;
+  /** Davlat taklifida `null`: davlatning ota-hududi bo'lmaydi. */
+  parentRegionId: string | null;
 }
 
 export interface RegionPublicationResolution {
@@ -78,6 +86,15 @@ export function parseRegionSuggestion(
     throw new RegionSuggestionValidationError('Taklif qilinayotgan hudud turi noto‘g‘ri.', 'payload.proposedRegion.level');
   }
 
+  const level = rawLevel as ProposedRegionLevel;
+
+  // Davlat ierarxiyaning tepasida turadi. Mijoz `parentRegionId`
+  // yuborgan bo'lsa ham e'tiborga olinmaydi — aks holda davlat
+  // o'zidan kichik hududning ichiga tushib qolardi.
+  if (level === 'republic') {
+    return { nameUz, level, parentRegionId: null };
+  }
+
   const parentRegionId = typeof value.parentRegionId === 'string' && value.parentRegionId.trim()
     ? value.parentRegionId.trim()
     : fallbackParentRegionId;
@@ -85,7 +102,7 @@ export function parseRegionSuggestion(
     throw new RegionSuggestionValidationError('Hududning yuqori bo‘g‘ini noto‘g‘ri.', 'payload.proposedRegion.parentRegionId');
   }
 
-  return { nameUz, level: rawLevel as ProposedRegionLevel, parentRegionId };
+  return { nameUz, level, parentRegionId };
 }
 
 /**
@@ -120,7 +137,7 @@ export function parseLocalIdentifier(
   return value;
 }
 
-export function canBeChildOf(child: ProposedRegionLevel, parent: string): boolean {
+export function canBeChildOf(child: Exclude<ProposedRegionLevel, 'republic'>, parent: string): boolean {
   return canCreateRegionUnder(child, parent);
 }
 
@@ -189,11 +206,16 @@ export function resolveRegionForPublication(
   const villageId = explicitSelection.villageId ?? null;
   const neighborhoodId = explicitSelection.neighborhoodId ?? null;
   const neighborhood = explicitSelection.neighborhood?.trim() || null;
-  const exactId = suggestion.level === 'district'
-    ? districtId
-    : suggestion.level === 'village'
-      ? villageId
-      : neighborhoodId;
+  // Davlat taklifi katalogdagi hech bir tuman/qishloq/mahallaga
+  // to'g'ridan-to'g'ri mos kelmaydi: so'z tanlangan hudud darajasida
+  // nashr qilinadi va davlatni moderator alohida yaratadi.
+  const exactId = suggestion.level === 'republic'
+    ? null
+    : suggestion.level === 'district'
+      ? districtId
+      : suggestion.level === 'village'
+        ? villageId
+        : neighborhoodId;
   const canonical = Boolean(exactId);
 
   return {

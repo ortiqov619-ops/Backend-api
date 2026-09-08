@@ -11,7 +11,12 @@ export type ModerationStatus = 'pending' | 'approved' | 'rejected' | 'needs_clar
 /** Ro‘yxatda yo‘q hudud: rasmiy katalogga faqat moderator/admin tasdig‘idan keyin qo‘shiladi. */
 export interface ProposedRegion {
   nameUz: string;
-  level: 'district' | 'village' | 'neighborhood';
+  /**
+   * `republic` — foydalanuvchi katalogda yo'q DAVLATNI taklif qilyapti.
+   * Davlatning yuqori bo'g'ini bo'lmaydi, shuning uchun bunda
+   * `parentRegionId` yuborilmaydi.
+   */
+  level: 'republic' | 'district' | 'village' | 'neighborhood';
   parentRegionId?: Uuid;
 }
 

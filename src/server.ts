@@ -537,7 +537,23 @@ async function payloadForPublication(source: Json, overrides: Json, client: Pool
   }
 
   let regionResolution: Json | null = null;
-  if (proposal) {
+  if (proposal?.level === 'republic') {
+    // Davlat taklifi so'zning hududini o'zgartirmaydi — so'z allaqachon
+    // tanlangan viloyatda nashr qilinadi. Shu sabab moderatordan
+    // "rasmiy hududga bog'lash" talab qilinmaydi: bog'lanadigan narsa
+    // yo'q. Davlat katalogga «Hududlar» bo'limi orqali qo'shiladi.
+    regionResolution = {
+      resolution: 'generalized',
+      proposedNameUz: proposal.nameUz,
+      proposedLevel: proposal.level,
+      matchedRegionId: null,
+      publishedDistrictId: asString(payload.districtId) || null,
+      publishedVillageId: asString(payload.villageId) || null,
+      publishedNeighborhoodId: asString(payload.neighborhoodId) || null,
+      publishedNeighborhood: asString(payload.neighborhood) || null,
+    };
+    delete payload.proposedRegion;
+  } else if (proposal) {
     if (!Object.prototype.hasOwnProperty.call(overrides, 'regionId')) {
       throw new RouteFault(422, 'validation_failed', 'Yangi hudud taklifini tasdiqlashdan oldin rasmiy hududga bog‘lang.');
     }
@@ -2209,7 +2225,25 @@ app.post('/v3/contributions/words', async (request, reply) => {
     throw error;
   }
 
-  if (proposedRegion) {
+  if (proposedRegion?.level === 'republic') {
+    // Davlat ierarxiyaning eng tepasida: ota-hudud, nasl va
+    // "ikkalasini birga tanlab bo'lmaydi" tekshiruvlari unga
+    // qo'llanmaydi — solishtiradigan yuqori bo'g'in yo'q.
+    //
+    // So'zning o'zi tanlangan viloyatda qoladi. Taklif moderator
+    // ko'rishi uchun payloadda saqlanadi; davlatni katalogga faqat
+    // moderator qo'shadi.
+    const countries = await db.query('SELECT id, name_uz FROM regions WHERE level=$1', ['republic']);
+    const duplicate = countries.rows.find(
+      (row) => normalizeRegionName(String(row.name_uz)) === normalizeRegionName(proposedRegion!.nameUz),
+    );
+    if (duplicate) {
+      return apiError(reply, 409, 'conflict', 'Bu davlat ro‘yxatda mavjud. “Boshqa” o‘rniga ro‘yxatdan tanlang.', {
+        'payload.proposedRegion.nameUz': ['Mavjud davlatni tanlang.'],
+      });
+    }
+    payload.proposedRegion = proposedRegion;
+  } else if (proposedRegion) {
     const conflictField = proposedRegion.level === 'district'
       ? 'districtId'
       : proposedRegion.level === 'village'
