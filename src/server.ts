@@ -91,8 +91,10 @@ import {
   deleteLegacyArtifact,
   deleteReleaseArtifact,
   getReleaseArtifactMeta,
+  legacyArtifactExists,
   putReleaseArtifact,
   readLegacyArtifact,
+  releaseArtifactExists,
   streamReleaseArtifact,
 } from './release-storage';
 import { AppContentValidationError, parseAppContentUpdate } from './app-content';
@@ -3484,15 +3486,41 @@ function releaseViewFrom(row: QueryResultRow) {
   };
 }
 
-/** Eng yuqori `version_code` ga ega faol reliz. */
+/**
+ * Eng yuqori `version_code` ga ega, HAQIQATAN yuklab olinadigan faol reliz.
+ *
+ * NEGA artefakt tekshiriladi: yozuv bor, lekin fayl yo'q holati
+ * foydalanuvchiga o'lik yangilanish ko'rsatardi — ilova "3.5.0 tayyor"
+ * deb aytib, "Yangilash" bosilganda "yuklab bo'lmadi" xatosini berardi.
+ * Bu haqiqatda yuz berdi: doimiy disksiz tarifda redeploy APK'larni
+ * o'chirib yubordi, reliz yozuvi esa faol qolib ketdi.
+ *
+ * `storage_key` bo'sh bo'lsa fayl bizda emas (tashqi `downloadUrl`
+ * bilan nashr qilingan reliz) — bunday yozuv tekshirilmaydi, aks holda
+ * mutlaqo to'g'ri reliz yashirinib qolardi.
+ *
+ * Bir nechta nomzod olinadi: eng yangisining artefakti yo'qolgan bo'lsa,
+ * undan oldingi ishlaydigan reliz taklif qilinadi — foydalanuvchi
+ * yangilanishsiz qolmaydi.
+ */
 async function latestActiveRelease(appType: string, platform: string): Promise<QueryResultRow | null> {
   const found = await db.query(
     `SELECT * FROM app_releases
       WHERE app_type=$1::app_type AND platform=$2::app_platform AND is_active
-      ORDER BY version_code DESC LIMIT 1`,
+      ORDER BY version_code DESC LIMIT 5`,
     [appType, platform],
   );
-  return found.rows[0] ?? null;
+  for (const row of found.rows) {
+    const storageKey = nullableString(row.storage_key);
+    if (!storageKey) return row;
+    if (await releaseArtifactExists(db, String(row.id))) return row;
+    if (await legacyArtifactExists(config.apkDir, storageKey)) return row;
+    app.log.error(
+      { appType, platform, versionCode: Number(row.version_code) },
+      'Faol relizning artefakti yo‘q — bu versiya e’lon qilinmaydi',
+    );
+  }
+  return null;
 }
 
 function apkFileName(appType: string, versionCode: number): string {

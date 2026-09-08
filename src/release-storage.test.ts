@@ -1,12 +1,16 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { randomBytes } from 'node:crypto';
+import { mkdtemp, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { Pool, type PoolClient } from 'pg';
 import { APP_TYPES } from './app-releases';
 import {
   ARTIFACT_CHUNK_BYTES,
   deleteReleaseArtifact,
   getReleaseArtifactMeta,
+  legacyArtifactExists,
   putReleaseArtifact,
   releaseArtifactExists,
   safeLegacyPath,
@@ -37,6 +41,19 @@ test('eski disk yo‘li saqlash katalogidan tashqariga chiqa olmaydi', () => {
 test('reliz turlari faqat USER va ADMIN', () => {
   // Noto'g'ri appType bilan yuklab olish yo'li umuman ochilmasligi kerak.
   assert.deepEqual([...APP_TYPES].sort(), ['ADMIN', 'USER']);
+});
+
+test('eski disk artefakti mavjudligi faylni o‘qimasdan aniqlanadi', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'xorazm-apk-'));
+  await writeFile(join(dir, 'user-20.apk'), 'apk');
+
+  assert.equal(await legacyArtifactExists(dir, 'user-20.apk'), true);
+  assert.equal(await legacyArtifactExists(dir, 'user-21.apk'), false, 'yo‘q fayl bor deb aytildi');
+  // Katalogdan tashqariga chiqadigan kalit hech qachon "bor" bo'lmasligi kerak.
+  assert.equal(await legacyArtifactExists(dir, '../../etc/passwd'), false);
+  assert.equal(await legacyArtifactExists(dir, null), false);
+  // Katalogning o'zi fayl emas.
+  assert.equal(await legacyArtifactExists(dir, '.'), false);
 });
 
 // ---------------------------------------------------------------------------

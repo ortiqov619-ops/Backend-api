@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { readFile, unlink } from 'node:fs/promises';
+import { readFile, stat, unlink } from 'node:fs/promises';
 import { resolve, sep } from 'node:path';
 import { Readable } from 'node:stream';
 
@@ -178,6 +178,23 @@ export async function readLegacyArtifact(apkDir: string, storageKey: string | nu
     return await readFile(path);
   } catch {
     return null;
+  }
+}
+
+/**
+ * Eski disk artefakti joyidami?
+ *
+ * `readLegacyArtifact` butun faylni xotiraga o'qiydi — faqat "bormi?"
+ * savoliga javob kerak bo'lganda bu isrof, 37 MB lik fayl uchun esa
+ * xavfli.
+ */
+export async function legacyArtifactExists(apkDir: string, storageKey: string | null): Promise<boolean> {
+  const path = safeLegacyPath(apkDir, storageKey);
+  if (!path) return false;
+  try {
+    return (await stat(path)).isFile();
+  } catch {
+    return false;
   }
 }
 
