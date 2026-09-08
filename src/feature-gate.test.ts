@@ -40,10 +40,24 @@ test('serverda mijozi yo‘q provider hech qachon ko‘rinmaydi', () => {
   }
   const features = appFeaturesFrom([
     { provider: 'push_notifications', isEnabled: true, hasSecret: true, health: 'ok' },
-    { provider: 'dialect_model', isEnabled: true, hasSecret: true, health: 'ok' },
   ]);
   assert.equal(features.pushNotifications, false);
+});
+
+test('sheva bahosini admin yoqadi va o‘chiradi', () => {
+  // Baho lokal qoida to'plamidan keladi, shuning uchun kalit va sog'liq
+  // tekshiruvi shart emas — faqat adminning yoqqan-yoqmagani muhim.
+  const on = appFeaturesFrom([{ provider: 'dialect_model', isEnabled: true, hasSecret: false, health: 'not_configured' }]);
+  assert.equal(on.dialectScoring, true, 'admin yoqqan baho ko‘rinmayapti');
+
+  const off = appFeaturesFrom([{ provider: 'dialect_model', isEnabled: false, hasSecret: true, health: 'ok' }]);
+  assert.equal(off.dialectScoring, false, 'admin o‘chirgan baho hamon ko‘rinyapti');
+});
+
+test('sheva bahosi boshqa providerlarga bog‘liq emas', () => {
+  const features = appFeaturesFrom([{ provider: 'stt_primary', isEnabled: true, hasSecret: true, health: 'ok' }]);
   assert.equal(features.dialectScoring, false);
+  assert.equal(features.transcription, true);
 });
 
 test('ro‘yxat bo‘sh bo‘lsa hamma imkoniyat yopiq', () => {

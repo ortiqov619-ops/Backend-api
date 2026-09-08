@@ -42,12 +42,21 @@ export interface AppFeatures {
 
 export function appFeaturesFrom(rows: readonly IntegrationRow[]): AppFeatures {
   const live = new Set(rows.filter(isIntegrationLive).map((row) => row.provider));
+  const enabled = new Set(rows.filter((row) => row.isEnabled).map((row) => row.provider));
   return {
     /** Yozilgan ovozni matnga o'girish. */
     transcription: live.has('stt_primary'),
     /** Push bildirishnomalar — serverda mijozi hali yozilmagan. */
     pushNotifications: live.has('push_notifications'),
-    /** Sheva mosligini avtomatik baholash — serverda mijozi yo'q. */
-    dialectScoring: live.has('dialect_model'),
+    /**
+     * Sheva mosligini baholash.
+     *
+     * Yuqoridagi TO'RTTA shart bu belgiga QO'LLANMAYDI va bu ataylab:
+     * baho tashqi modeldan emas, serverdagi lokal qoida to'plamidan
+     * keladi, ya'ni kalit ham, sog'liq tekshiruvi ham ma'nosiz. Yagona
+     * savol — loyiha egasi bu belgini ko'rsatishni xohlaydimi. Uni
+     * «Integratsiyalar» bo'limidan yoqadi yoki o'chiradi.
+     */
+    dialectScoring: enabled.has('dialect_model'),
   };
 }
