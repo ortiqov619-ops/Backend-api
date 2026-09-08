@@ -2650,6 +2650,43 @@ app.get('/v3/requests', async (request, reply) => {
  * biriktirilgan, yoki (0007 migratsiyasi dublikatni ajratgani sabab) hech
  * qayerga bog'lanmagan. Oldingi ro'yxat faqat birinchisini ko'rsatardi.
  */
+/**
+ * Fayli yo'qolgan audio yozuvini butunlay o'chiradi.
+ *
+ * FAQAT `storage_available = false` bo'lgan yozuv o'chadi. Sabab:
+ * tinglash mumkin bo'lgan yozuvni o'chirish moderatsiya tarixini
+ * yo'qotadi va uni qaytarib bo'lmaydi — bunday yozuv uchun "rad etish"
+ * bor. Bu endpoint esa faqat doimiy disksiz muhitdan qolgan, hech
+ * qachon tinglab bo'lmaydigan "o'lik" qatorlarni tozalaydi.
+ *
+ * O'chirishning o'zi majburiy emas: qaysi yozuv qolishini admin hal
+ * qiladi.
+ */
+app.delete('/v3/audio/:id', async (request, reply) => {
+  const claims = await requirePermission(request, reply, 'audio:moderate'); if (!claims) return;
+  const id = asString((request.params as Json).id);
+  if (!isUuid(id)) return apiError(reply, 422, 'validation_failed', 'Audio identifikatori noto‘g‘ri.');
+  const reason = asString(asObject(request.body).reason);
+  if (!reason) return apiError(reply, 422, 'validation_failed', 'O‘chirish sababi majburiy.', { reason: ['Sababni yozing.'] });
+
+  const found = await db.query('SELECT id, storage_available, storage_key, expected_text FROM audio_submissions WHERE id=$1', [id]);
+  const row = found.rows[0];
+  if (!row) return apiError(reply, 404, 'not_found', 'Audio topilmadi.');
+  if (row.storage_available) {
+    return apiError(reply, 409, 'conflict', 'Bu yozuvni tinglash mumkin, shuning uchun u o‘chirilmaydi. Kerak bo‘lsa uni rad eting.');
+  }
+
+  await db.query('DELETE FROM audio_submissions WHERE id=$1', [id]);
+  // Diskda qoldiq bo'lsa u ham ketadi; fayl allaqachon yo'q bo'lsa bu
+  // amal jimgina o'tadi.
+  await deleteLegacyArtifact(config.uploadDir, nullableString(row.storage_key));
+  await audit(claims, 'audio.decision', 'audio_submission', id, reason, {
+    action: 'delete_missing_file',
+    expectedText: nullableString(row.expected_text),
+  }, request);
+  return { deleted: true };
+});
+
 app.get('/v3/audio/moderation', async (request, reply) => {
   if (!(await requirePermission(request, reply, 'audio:read'))) return;
   const query = request.query as Json;
@@ -2664,6 +2701,11 @@ app.get('/v3/audio/moderation', async (request, reply) => {
     where.push(`a.moderation_status = $${params.length}::moderation_status`);
   }
   if (query.analysisStatus) { params.push(asString(query.analysisStatus)); where.push(`a.analysis_status = $${params.length}::audio_analysis_status`); }
+  // Fayli yo'qolgan yozuvlarni topish uchun: ular tozalanishi kerak,
+  // lekin ularni butun navbat ichidan qidirib o'tirish og'ir edi.
+  if (query.storageAvailable !== undefined) {
+    where.push(bool(query.storageAvailable) ? 'a.storage_available' : 'NOT a.storage_available');
+  }
   // Almashtirilgan (qayta yozilgan) versiyalar navbatda ko'rinmaydi — ular
   // faqat audit uchun saqlanadi.
   if (!bool(query.includeSuperseded)) where.push('a.superseded_at IS NULL');

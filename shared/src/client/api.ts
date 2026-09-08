@@ -271,6 +271,16 @@ export class XorazmApiClient {
     return this.http.request('PATCH', `/audio/${id}/moderation`, { body });
   }
 
+  /**
+   * Fayli yo'qolgan yozuvni butunlay o'chiradi.
+   *
+   * Server tinglash mumkin bo'lgan yozuvni o'chirmaydi — bunday
+   * yozuvni rad etish kerak, o'chirish emas.
+   */
+  deleteAudio(id: Uuid, body: { reason: string }): Promise<{ deleted: boolean }> {
+    return this.http.request('DELETE', `/audio/${id}`, { body });
+  }
+
   /* ------------------------------ admin ------------------------------ */
 
   dashboard(): Promise<DashboardResponse> {

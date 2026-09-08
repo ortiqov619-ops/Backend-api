@@ -130,6 +130,13 @@ export interface AudioModerationQuery {
   analysisStatus?: AudioAnalysisStatus;
   /** Tarixni ko'rish uchun; standart holatda faqat joriy versiyalar qaytadi. */
   includeSuperseded?: boolean;
+  /**
+   * `false` — fayli yo'qolgan, tinglab bo'lmaydigan yozuvlar.
+   *
+   * Ular doimiy disksiz muhitdan qolgan va tozalanishi kerak, lekin
+   * butun navbat ichidan qo'lda qidirish og'ir edi.
+   */
+  storageAvailable?: boolean;
   page?: number;
   pageSize?: number;
 }
