@@ -46,7 +46,17 @@ export interface ContributionPayload {
   literaryForm?: string;
   example?: string;
   category?: string;
+  /** Urug' yoki qabila nomi. */
   clan?: string;
+  /**
+   * Urug' laqabi / oilaviy laqab.
+   *
+   * `clan` dan boshqa narsa: urug'ning nomi bir xil bo'lsa ham oilalar
+   * bir-biridan laqab bilan farqlanadi. `words` jadvalida ustuni yo'q —
+   * u `dialect` va `neighborhood` kabi payloadda qoladi va moderator
+   * uni taklif kartasida ko'radi.
+   */
+  familyNickname?: string;
   note?: string;
   dialectId?: Uuid;
   /**

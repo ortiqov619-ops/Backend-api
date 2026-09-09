@@ -30,8 +30,8 @@ export const CONTRIBUTION_RULE_FIELDS = [
 export type ContributionRuleField = (typeof CONTRIBUTION_RULE_FIELDS)[number];
 
 export const CONTRIBUTION_RULE_LABELS: Record<ContributionRuleField, string> = {
-  clan: 'Urug‘ / laqab',
-  dialectId: 'Lahja',
+  clan: 'Urug‘ (yoki qabila)',
+  dialectId: 'Sheva (lahja)',
   audio: 'Talaffuz yozuvi',
 };
 

@@ -2452,7 +2452,7 @@ app.post('/v3/contributions/words', async (request, reply) => {
   // yo'q lahja nomi. Ular katalogga bog'lanmaydi, shuning uchun
   // uzunligi va belgilari shu yerda cheklanadi.
   try {
-    for (const [field, maxLength] of [['neighborhood', 80], ['clan', 60], ['dialect', 60]] as const) {
+    for (const [field, maxLength] of [['neighborhood', 80], ['clan', 60], ['dialect', 60], ['familyNickname', 60]] as const) {
       const normalized = parseLocalIdentifier(payload[field], `payload.${field}`, { maxLength });
       if (normalized) payload[field] = normalized;
       else delete payload[field];
