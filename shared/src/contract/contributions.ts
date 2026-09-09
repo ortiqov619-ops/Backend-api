@@ -207,8 +207,16 @@ export interface UpdateRequestStatusRequest {
   status: Exclude<ModerationStatus, 'pending'>;
   /** `rejected` va `needs_clarification` uchun majburiy. */
   reason?: string;
-  /** Moderator tuzatgan yakuniy maydonlar (approve paytida). */
-  overrides?: Partial<ContributionPayload>;
+  /**
+   * Moderator tuzatgan yakuniy maydonlar (approve paytida).
+   *
+   * `acceptProposedRegion` — payload maydoni emas, moderator qarori:
+   * foydalanuvchi taklif qilgan nomni rasmiy katalogga yozish. U
+   * yoqilganda hudud yaratiladi va so'z o'sha yangi hududga
+   * bog'lanadi, ya'ni nom keyingi foydalanuvchilarga tanlov sifatida
+   * ko'rinadi.
+   */
+  overrides?: Partial<ContributionPayload> & { acceptProposedRegion?: boolean };
   /** Audio ham shu qaror bilan birga hal qilinsinmi. */
   applyToAudio?: boolean;
   expectedUpdatedAt: IsoDateTime;

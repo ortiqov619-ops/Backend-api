@@ -9,6 +9,7 @@ import {
   normalizeRegionName,
   parseLocalIdentifier,
   parseRegionSuggestion,
+  regionCodeFromName,
   resolveRegionForPublication,
   uniqueDialectIdByLabel,
   RegionSuggestionValidationError,
@@ -206,4 +207,26 @@ test('boshqa darajalar davlat qo‘shilgandan keyin ham o‘zgarmaydi', () => {
     level: 'district',
     parentRegionId: XORAZM_ID,
   });
+});
+
+// ---------------------------------------------------------------------------
+// Katalog kodi
+// ---------------------------------------------------------------------------
+
+test('katalog kodi nomdan xavfsiz hosil bo‘ladi', () => {
+  assert.equal(regionCodeFromName('Qo‘shko‘pir'), 'qoshkopir');
+  assert.equal(regionCodeFromName('Shomaxulum mahallasi'), 'shomaxulum-mahallasi');
+  assert.equal(regionCodeFromName('  Yangi   Bog‘  '), 'yangi-bog');
+  // Apostrof va chiziqcha kodga o'tmaydi.
+  assert.match(regionCodeFromName('O‘zbekiston'), /^[a-z0-9-]+$/);
+});
+
+test('lotin harfi qolmasa kod bo‘sh bo‘lmaydi', () => {
+  // Bo'sh kod unikal indeksni buzardi; chaqiruvchi qo'shimcha qo'shadi.
+  assert.equal(regionCodeFromName('Қишлоқ'), 'hudud');
+  assert.equal(regionCodeFromName('—'), 'hudud');
+});
+
+test('kod uzunligi cheklangan', () => {
+  assert.ok(regionCodeFromName('a'.repeat(200)).length <= 40);
 });

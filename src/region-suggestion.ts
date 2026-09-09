@@ -137,6 +137,29 @@ export function parseLocalIdentifier(
   return value;
 }
 
+/**
+ * Taklif qilingan hudud nomidan katalog kodi.
+ *
+ * Kod ichki identifikator: u FK emas, lekin unikal bo'lishi shart va
+ * URLda ham ko'rinadi, shuning uchun faqat lotin harflari, raqam va
+ * chiziqcha qoldiriladi. O'zbek apostroflari (o‘, g‘) oddiy harfga
+ * tushadi — aks holda kod o'qib bo'lmaydigan ko'rinishga kelardi.
+ *
+ * Nomdan hech narsa qolmasa (masalan faqat kirilcha yozilgan bo'lsa)
+ * `hudud` qaytadi va chaqiruvchi unga takrorlanmas qo'shimcha qo'shadi.
+ */
+export function regionCodeFromName(nameUz: string): string {
+  const latin = nameUz
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[‘’ʻʼ`']/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 40);
+  return latin || 'hudud';
+}
+
 export function canBeChildOf(child: Exclude<ProposedRegionLevel, 'republic'>, parent: string): boolean {
   return canCreateRegionUnder(child, parent);
 }

@@ -39,6 +39,7 @@ import {
   normalizeRegionName,
   parseLocalIdentifier,
   parseRegionSuggestion,
+  regionCodeFromName,
   resolveRegionForPublication,
   RegionSuggestionValidationError,
 } from './region-suggestion';
@@ -524,7 +525,47 @@ async function primaryAudioFor(wordId: string): Promise<{ id: string; playbackUr
 }
 async function activeFences() { const result = await db.query('SELECT * FROM geofences WHERE is_active = true'); return result.rows.map(mapFence); }
 
-async function payloadForPublication(source: Json, overrides: Json, client: PoolClient): Promise<{ payload: Json; regionResolution: Json | null; dialectResolution: Json | null }> {
+/**
+ * Tasdiqlangan taklifni rasmiy katalogga yozadi.
+ *
+ * NEGA OCHIQ (`is_contribution_allowed = true`): loyiha egasi bu nomni
+ * ATAYLAB qabul qildi, va talab aynan shu — tasdiqdan keyin nom
+ * tanlovlar ro'yxatida paydo bo'lsin. Ilova ro'yxatlari yopiq
+ * hududlarni ko'rsatmaydi, shuning uchun yopiq yaratilsa nom hech
+ * qachon ko'rinmasdi.
+ *
+ * Qo'lda yaratish yo'li (`POST /admin/regions`) o'z ehtiyotkor sukutini
+ * saqlaydi — u boshqa maqsad uchun: katalogni oldindan tayyorlash.
+ *
+ * Kod nomdan hosil bo'ladi; to'qnashsa raqam qo'shiladi, chunki kod
+ * unikal bo'lishi shart.
+ */
+async function createRegionFromProposal(
+  client: PoolClient,
+  proposal: { nameUz: string; level: string; parentRegionId: string | null },
+  moderatorId: string,
+): Promise<string> {
+  const base = regionCodeFromName(proposal.nameUz);
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const code = attempt === 0 ? base : `${base}-${attempt + 1}`;
+    try {
+      const created = await client.query<{ id: string }>(
+        `INSERT INTO regions (code, name_uz, parent_id, level, is_contribution_allowed, sort_order, created_by, updated_by)
+         VALUES ($1, $2, $3::uuid, $4::region_level, true,
+                 COALESCE((SELECT max(sort_order) + 1 FROM regions), 1), $5::uuid, $5::uuid)
+         RETURNING id`,
+        [code, proposal.nameUz, proposal.parentRegionId, proposal.level, moderatorId],
+      );
+      return String(created.rows[0]!.id);
+    } catch (error) {
+      // 23505 — kod band. Faqat shu holatda qayta urinamiz.
+      if ((error as { code?: string }).code !== '23505') throw error;
+    }
+  }
+  throw new RouteFault(409, 'conflict', 'Hudud kodi band — nomni biroz o‘zgartirib qayta urinib ko‘ring.');
+}
+
+async function payloadForPublication(source: Json, overrides: Json, client: PoolClient, moderatorId: string): Promise<{ payload: Json; regionResolution: Json | null; dialectResolution: Json | null }> {
   const payload = { ...source, ...overrides };
   const sourceProposal = source.proposedRegion;
   const regionId = asString(payload.regionId) || '00000000-0000-4000-8000-000000000001';
@@ -544,16 +585,25 @@ async function payloadForPublication(source: Json, overrides: Json, client: Pool
   }
 
   let regionResolution: Json | null = null;
+  // Moderator taklif qilingan nomni rasmiy katalogga qo'shishni
+  // aniq tanladimi. Bu ataylab explicit: tasdiqlashning o'zi nomni
+  // katalogga yozmaydi, chunki taklif mavjud hududning boshqacha
+  // yozilishi bo'lishi ham mumkin.
+  const acceptProposal = bool(overrides.acceptProposedRegion);
+
   if (proposal?.level === 'republic') {
     // Davlat taklifi so'zning hududini o'zgartirmaydi — so'z allaqachon
-    // tanlangan viloyatda nashr qilinadi. Shu sabab moderatordan
-    // "rasmiy hududga bog'lash" talab qilinmaydi: bog'lanadigan narsa
-    // yo'q. Davlat katalogga «Hududlar» bo'limi orqali qo'shiladi.
+    // tanlangan viloyatda nashr qilinadi va davlatning ostida hali
+    // birorta viloyat yo'q.
+    const createdCountryId = acceptProposal
+      ? await createRegionFromProposal(client, proposal, moderatorId)
+      : null;
     regionResolution = {
       resolution: 'generalized',
       proposedNameUz: proposal.nameUz,
       proposedLevel: proposal.level,
       matchedRegionId: null,
+      createdRegionId: createdCountryId,
       publishedDistrictId: asString(payload.districtId) || null,
       publishedVillageId: asString(payload.villageId) || null,
       publishedNeighborhoodId: asString(payload.neighborhoodId) || null,
@@ -561,8 +611,8 @@ async function payloadForPublication(source: Json, overrides: Json, client: Pool
     };
     delete payload.proposedRegion;
   } else if (proposal) {
-    if (!Object.prototype.hasOwnProperty.call(overrides, 'regionId')) {
-      throw new RouteFault(422, 'validation_failed', 'Yangi hudud taklifini tasdiqlashdan oldin rasmiy hududga bog‘lang.');
+    if (!acceptProposal && !Object.prototype.hasOwnProperty.call(overrides, 'regionId')) {
+      throw new RouteFault(422, 'validation_failed', 'Yangi hudud taklifini tasdiqlashdan oldin rasmiy hududga bog‘lang yoki uni yangi hudud sifatida qabul qiling.');
     }
     const parent = await client.query('SELECT id, name_uz, parent_id, level, is_contribution_allowed FROM regions WHERE id=$1', [proposal.parentRegionId]);
     if (!parent.rows[0] || !parent.rows[0].is_contribution_allowed || !canBeChildOf(proposal.level, String(parent.rows[0].level))) {
@@ -589,27 +639,67 @@ async function payloadForPublication(source: Json, overrides: Json, client: Pool
         throw new RouteFault(422, 'validation_failed', 'Moderator tanlagan qishloq aynan tanlangan tumanga tegishli bo‘lishi kerak.');
       }
     }
-    const resolved = resolveRegionForPublication(proposal, {
-      districtId: explicitDistrictId,
-      villageId: explicitVillageId,
-      neighborhoodId: explicitNeighborhoodId,
-      neighborhood: explicitNeighborhood,
-    });
-    payload.districtId = resolved.districtId ?? undefined;
-    payload.villageId = resolved.villageId ?? undefined;
-    payload.neighborhoodId = resolved.neighborhoodId ?? undefined;
-    payload.neighborhood = resolved.neighborhood ?? undefined;
-    delete payload.proposedRegion;
-    regionResolution = {
-      resolution: resolved.resolution,
-      proposedNameUz: proposal.nameUz,
-      proposedLevel: proposal.level,
-      matchedRegionId: resolved.matchedRegionId,
-      publishedDistrictId: resolved.districtId,
-      publishedVillageId: resolved.villageId,
-      publishedNeighborhoodId: resolved.neighborhoodId,
-      publishedNeighborhood: resolved.neighborhood,
-    };
+    // Moderator nomni yangi hudud sifatida qabul qilsa, u katalogga
+    // yoziladi va so'z aynan o'sha yangi hududga bog'lanadi. Aks holda
+    // eski xulq saqlanadi: faqat moderator tanlagan mavjud hudud
+    // ishlatiladi.
+    if (acceptProposal) {
+      const createdId = await createRegionFromProposal(client, proposal, moderatorId);
+      const field = proposal.level === 'district' ? 'districtId'
+        : proposal.level === 'village' ? 'villageId'
+        : 'neighborhoodId';
+      // Yangi hudud o'z ota-hududi bilan birga yoziladi: qishloq
+      // tumansiz, mahalla esa qishloq yoki tumansiz qolib ketmasligi
+      // kerak.
+      if (proposal.level === 'village') payload.districtId = proposal.parentRegionId ?? undefined;
+      if (proposal.level === 'neighborhood') {
+        const parentLevel = String(parent.rows[0].level);
+        if (parentLevel === 'village') {
+          payload.villageId = proposal.parentRegionId ?? undefined;
+          payload.districtId = nullableString(parent.rows[0].parent_id) ?? undefined;
+        } else {
+          payload.districtId = proposal.parentRegionId ?? undefined;
+        }
+      }
+      payload[field] = createdId;
+      // Erkin matnli mahalla nomi endi keraksiz: u katalog yozuviga aylandi.
+      payload.neighborhood = undefined;
+      delete payload.proposedRegion;
+      regionResolution = {
+        resolution: 'canonical',
+        proposedNameUz: proposal.nameUz,
+        proposedLevel: proposal.level,
+        matchedRegionId: createdId,
+        createdRegionId: createdId,
+        publishedDistrictId: asString(payload.districtId) || null,
+        publishedVillageId: asString(payload.villageId) || null,
+        publishedNeighborhoodId: asString(payload.neighborhoodId) || null,
+        publishedNeighborhood: null,
+      };
+    } else {
+      const resolved = resolveRegionForPublication(proposal, {
+        districtId: explicitDistrictId,
+        villageId: explicitVillageId,
+        neighborhoodId: explicitNeighborhoodId,
+        neighborhood: explicitNeighborhood,
+      });
+      payload.districtId = resolved.districtId ?? undefined;
+      payload.villageId = resolved.villageId ?? undefined;
+      payload.neighborhoodId = resolved.neighborhoodId ?? undefined;
+      payload.neighborhood = resolved.neighborhood ?? undefined;
+      delete payload.proposedRegion;
+      regionResolution = {
+        resolution: resolved.resolution,
+        proposedNameUz: proposal.nameUz,
+        proposedLevel: proposal.level,
+        matchedRegionId: resolved.matchedRegionId,
+        createdRegionId: null,
+        publishedDistrictId: resolved.districtId,
+        publishedVillageId: resolved.villageId,
+        publishedNeighborhoodId: resolved.neighborhoodId,
+        publishedNeighborhood: resolved.neighborhood,
+      };
+    }
   }
   // `words` jadvali faqat canonical ustunlarni oladi. Proposal faqat manba
   // contribution payloadida audit uchun qoladi.
@@ -2850,7 +2940,7 @@ app.patch('/v3/requests/:id/status', async (request, reply) => {
     if (sourcePayload.proposedRegion !== undefined) storedPayload.proposedRegion = sourcePayload.proposedRegion;
     let wordId: string | null = null; let regionResolution: Json | null = null; let dialectResolution: Json | null = null;
     if (status === 'approved') {
-      const publication = await payloadForPublication(sourcePayload, overrides, client);
+      const publication = await payloadForPublication(sourcePayload, overrides, client, claims.sub);
       regionResolution = publication.regionResolution;
       dialectResolution = publication.dialectResolution;
       const published = publication.payload;
