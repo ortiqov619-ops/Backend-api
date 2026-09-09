@@ -230,3 +230,43 @@ test('lotin harfi qolmasa kod bo‘sh bo‘lmaydi', () => {
 test('kod uzunligi cheklangan', () => {
   assert.ok(regionCodeFromName('a'.repeat(200)).length <= 40);
 });
+
+// ---------------------------------------------------------------------------
+// Viloyat taklifi
+// ---------------------------------------------------------------------------
+
+const UZBEKISTAN_ID = '00000000-0000-4000-8000-000000000000';
+
+test('viloyat taklifi davlatni ota-hudud sifatida oladi', () => {
+  assert.deepEqual(
+    parseRegionSuggestion({ nameUz: 'Buxoro viloyati', level: 'region', parentRegionId: UZBEKISTAN_ID }, XORAZM_ID),
+    { nameUz: 'Buxoro viloyati', level: 'region', parentRegionId: UZBEKISTAN_ID },
+  );
+});
+
+test('viloyat taklifida davlat berilmasa rad etiladi', () => {
+  // `fallbackParentRegionId` viloyat — u viloyatning ota-hududi bo'la olmaydi,
+  // shuning uchun unga jimgina tushib qolish xato bo'lardi.
+  assert.throws(
+    () => parseRegionSuggestion({ nameUz: 'Buxoro viloyati', level: 'region' }, XORAZM_ID),
+    /davlatni tanlang/i,
+  );
+});
+
+test('davlat hech kimning farzandi emas', () => {
+  for (const parent of ['republic', 'region', 'district', 'village', 'neighborhood']) {
+    assert.equal(canBeChildOf('republic', parent), false, parent);
+  }
+  // Viloyat esa faqat davlat ostiga tushadi.
+  assert.equal(canBeChildOf('region', 'republic'), true);
+  assert.equal(canBeChildOf('region', 'region'), false);
+});
+
+test('viloyat taklifi so‘zni hech qanday tumanga bog‘lamaydi', () => {
+  const resolved = resolveRegionForPublication(
+    { nameUz: 'Buxoro viloyati', level: 'region', parentRegionId: UZBEKISTAN_ID },
+    { districtId: '10000000-0000-4000-8000-000000000002' },
+  );
+  assert.equal(resolved.matchedRegionId, null);
+  assert.equal(resolved.resolution, 'generalized');
+});

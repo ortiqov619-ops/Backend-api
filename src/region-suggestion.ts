@@ -5,7 +5,7 @@
  * ota-hududi yo'q; qolgan darajalar esa har doim mavjud hududning
  * ichiga taklif qilinadi.
  */
-export const PROPOSED_REGION_LEVELS = ['republic', 'district', 'village', 'neighborhood'] as const;
+export const PROPOSED_REGION_LEVELS = ['republic', 'region', 'district', 'village', 'neighborhood'] as const;
 
 export type ProposedRegionLevel = (typeof PROPOSED_REGION_LEVELS)[number];
 export type CanonicalRegionLevel = 'republic' | 'region' | ProposedRegionLevel;
@@ -88,11 +88,21 @@ export function parseRegionSuggestion(
 
   const level = rawLevel as ProposedRegionLevel;
 
-  // Davlat ierarxiyaning tepasida turadi. Mijoz `parentRegionId`
-  // yuborgan bo'lsa ham e'tiborga olinmaydi — aks holda davlat
-  // o'zidan kichik hududning ichiga tushib qolardi.
+  // Davlat ierarxiyaning tepasida turadi: unga ota-hudud berib
+  // bo'lmaydi, aks holda davlat o'zidan kichik hududning ichiga tushib
+  // qolardi. Mijoz yuborgan qiymat e'tiborga olinmaydi.
   if (level === 'republic') {
     return { nameUz, level, parentRegionId: null };
+  }
+  // Viloyatning ustida davlat turadi va u tanlangan bo'lishi kerak.
+  // Berilmasa `fallbackParentRegionId` ishlatilmaydi: u viloyat, ya'ni
+  // viloyatning ota-hududi bo'la olmaydi.
+  if (level === 'region') {
+    const countryId = typeof value.parentRegionId === 'string' ? value.parentRegionId.trim() : '';
+    if (!UUID_PATTERN.test(countryId)) {
+      throw new RegionSuggestionValidationError('Yangi viloyat uchun davlatni tanlang.', 'payload.proposedRegion.parentRegionId');
+    }
+    return { nameUz, level, parentRegionId: countryId };
   }
 
   const parentRegionId = typeof value.parentRegionId === 'string' && value.parentRegionId.trim()
@@ -160,7 +170,16 @@ export function regionCodeFromName(nameUz: string): string {
   return latin || 'hudud';
 }
 
-export function canBeChildOf(child: Exclude<ProposedRegionLevel, 'republic'>, parent: string): boolean {
+/**
+ * Taklif qilingan daraja shu ota-hududning ostiga tushadimi.
+ *
+ * `republic` uchun har doim `false`: davlatning ustida hech narsa
+ * bo'lmaydi, ya'ni u hech kimning farzandi emas. Bu yerda uni turlar
+ * bilan taqiqlash o'rniga javob berish afzal — chaqiruvchi kod
+ * darajani ajratib o'tirmaydi.
+ */
+export function canBeChildOf(child: ProposedRegionLevel, parent: string): boolean {
+  if (child === 'republic') return false;
   return canCreateRegionUnder(child, parent);
 }
 
@@ -232,7 +251,7 @@ export function resolveRegionForPublication(
   // Davlat taklifi katalogdagi hech bir tuman/qishloq/mahallaga
   // to'g'ridan-to'g'ri mos kelmaydi: so'z tanlangan hudud darajasida
   // nashr qilinadi va davlatni moderator alohida yaratadi.
-  const exactId = suggestion.level === 'republic'
+  const exactId = suggestion.level === 'republic' || suggestion.level === 'region'
     ? null
     : suggestion.level === 'district'
       ? districtId

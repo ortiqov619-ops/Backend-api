@@ -12,12 +12,31 @@ export type ModerationStatus = 'pending' | 'approved' | 'rejected' | 'needs_clar
 export interface ProposedRegion {
   nameUz: string;
   /**
-   * `republic` — foydalanuvchi katalogda yo'q DAVLATNI taklif qilyapti.
-   * Davlatning yuqori bo'g'ini bo'lmaydi, shuning uchun bunda
-   * `parentRegionId` yuborilmaydi.
+   * `republic` — katalogda yo'q DAVLAT. Uning yuqori bo'g'ini bo'lmaydi,
+   * shuning uchun `parentRegionId` yuborilmaydi.
+   *
+   * `region` — katalogda yo'q VILOYAT. Uning ustida davlat turadi, lekin
+   * so'zning o'zi baribir tanlangan mavjud viloyatda qoladi: yangi
+   * viloyat hali yo'q va unga so'z bog'lab bo'lmaydi.
+   *
+   * Qolgan darajalar so'z yuborilayotgan viloyatning ICHIDA bo'ladi va
+   * ular uchun ierarxiya qat'iy tekshiriladi.
    */
-  level: 'republic' | 'district' | 'village' | 'neighborhood';
+  level: 'republic' | 'region' | 'district' | 'village' | 'neighborhood';
   parentRegionId?: Uuid;
+}
+
+/**
+ * Taklif so'z yuborilayotgan viloyatdan YUQORIDA turadimi.
+ *
+ * Bunday taklif so'zning hududini o'zgartirmaydi va uni tekshirishda
+ * viloyat ichidagi ierarxiya qoidalari qo'llanmaydi — solishtiradigan
+ * umumiy ota-hudud yo'q.
+ */
+export function isAboveRegionProposal(
+  level: ProposedRegion['level'],
+): level is 'republic' | 'region' {
+  return level === 'republic' || level === 'region';
 }
 
 /** So'z/izoh uchun foydalanuvchi kiritgan mazmun. */
@@ -30,6 +49,14 @@ export interface ContributionPayload {
   clan?: string;
   note?: string;
   dialectId?: Uuid;
+  /**
+   * Ro'yxatda yo'q lahja nomi.
+   *
+   * `neighborhood` bilan bir xil naqsh: katalogga bog'lanmaydi va
+   * `words.dialect_id` uchun ishlatilmaydi — moderator ko'rishi uchun
+   * payloadda saqlanadi.
+   */
+  dialect?: string;
   regionId?: Uuid;
   districtId?: Uuid;
   villageId?: Uuid;

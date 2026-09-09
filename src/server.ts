@@ -109,6 +109,7 @@ import {
 } from '@xorazm/shared';
 import { decideAdminAccess } from './admin-access';
 import { createRegionFromProposal, RegionCodeExhaustedError } from './region-catalog';
+import { isAboveRegionProposal } from '@xorazm/shared';
 import { submitterDisplayName } from './guest-identity';
 import { blockedMessage, decideContributionAccess } from './contribution-access';
 import { buildWordListFilters, WordFilterValidationError } from './word-filters';
@@ -555,11 +556,11 @@ async function payloadForPublication(source: Json, overrides: Json, client: Pool
   // yozilishi bo'lishi ham mumkin.
   const acceptProposal = bool(overrides.acceptProposedRegion);
 
-  if (proposal?.level === 'republic') {
-    // Davlat taklifi so'zning hududini o'zgartirmaydi — so'z allaqachon
+  if (proposal && isAboveRegionProposal(proposal.level)) {
+    // Davlat va viloyat taklifi so'zning hududini o'zgartirmaydi — so'z allaqachon
     // tanlangan viloyatda nashr qilinadi va davlatning ostida hali
     // birorta viloyat yo'q.
-    const createdCountryId = acceptProposal
+    const createdAboveId = acceptProposal
       ? await createRegionFromProposal(client, proposal, moderatorId)
       : null;
     regionResolution = {
@@ -567,7 +568,7 @@ async function payloadForPublication(source: Json, overrides: Json, client: Pool
       proposedNameUz: proposal.nameUz,
       proposedLevel: proposal.level,
       matchedRegionId: null,
-      createdRegionId: createdCountryId,
+      createdRegionId: createdAboveId,
       publishedDistrictId: asString(payload.districtId) || null,
       publishedVillageId: asString(payload.villageId) || null,
       publishedNeighborhoodId: asString(payload.neighborhoodId) || null,
@@ -2306,21 +2307,32 @@ app.post('/v3/contributions/words', async (request, reply) => {
     throw error;
   }
 
-  if (proposedRegion?.level === 'republic') {
-    // Davlat ierarxiyaning eng tepasida: ota-hudud, nasl va
-    // "ikkalasini birga tanlab bo'lmaydi" tekshiruvlari unga
-    // qo'llanmaydi — solishtiradigan yuqori bo'g'in yo'q.
+  if (proposedRegion && isAboveRegionProposal(proposedRegion.level)) {
+    // Davlat va viloyat so'z yuborilayotgan viloyatdan YUQORIDA turadi:
+    // nasl tekshiruvi va "ikkalasini birga tanlab bo'lmaydi" qoidasi
+    // ularga qo'llanmaydi, chunki solishtiradigan umumiy ota-hudud yo'q.
     //
     // So'zning o'zi tanlangan viloyatda qoladi. Taklif moderator
-    // ko'rishi uchun payloadda saqlanadi; davlatni katalogga faqat
-    // moderator qo'shadi.
-    const countries = await db.query('SELECT id, name_uz FROM regions WHERE level=$1', ['republic']);
-    const duplicate = countries.rows.find(
+    // ko'rishi uchun payloadda saqlanadi; katalogga faqat moderator
+    // qo'shadi.
+    if (proposedRegion.level === 'region') {
+      // Viloyatning ustidagi davlat haqiqiy bo'lishi kerak.
+      const country = await db.query('SELECT level::text AS level FROM regions WHERE id=$1', [proposedRegion.parentRegionId]);
+      if (String(country.rows[0]?.level ?? '') !== 'republic') {
+        return apiError(reply, 422, 'validation_failed', 'Yangi viloyat uchun davlatni qayta tanlang.', {
+          'payload.proposedRegion.parentRegionId': ['Davlatni tanlang.'],
+        });
+      }
+    }
+    const siblings = proposedRegion.level === 'republic'
+      ? await db.query('SELECT id, name_uz FROM regions WHERE level=$1', ['republic'])
+      : await db.query('SELECT id, name_uz FROM regions WHERE level=$1 AND parent_id=$2', ['region', proposedRegion.parentRegionId]);
+    const duplicate = siblings.rows.find(
       (row) => normalizeRegionName(String(row.name_uz)) === normalizeRegionName(proposedRegion!.nameUz),
     );
     if (duplicate) {
-      return apiError(reply, 409, 'conflict', 'Bu davlat ro‘yxatda mavjud. “Boshqa” o‘rniga ro‘yxatdan tanlang.', {
-        'payload.proposedRegion.nameUz': ['Mavjud davlatni tanlang.'],
+      return apiError(reply, 409, 'conflict', 'Bu hudud ro‘yxatda mavjud. “Boshqa” o‘rniga ro‘yxatdan tanlang.', {
+        'payload.proposedRegion.nameUz': ['Mavjud hududni tanlang.'],
       });
     }
     payload.proposedRegion = proposedRegion;
@@ -2436,10 +2448,11 @@ app.post('/v3/contributions/words', async (request, reply) => {
       'payload.neighborhood': ['Bittasini tanlang.'],
     });
   }
-  // Erkin matnli hudud maydonlari: mahalla nomi va urug'/laqab. Ular
-  // katalogga bog'lanmaydi, shuning uchun bu yerda cheklanadi.
+  // Erkin matnli maydonlar: mahalla nomi, urug'/laqab va ro'yxatda
+  // yo'q lahja nomi. Ular katalogga bog'lanmaydi, shuning uchun
+  // uzunligi va belgilari shu yerda cheklanadi.
   try {
-    for (const [field, maxLength] of [['neighborhood', 80], ['clan', 60]] as const) {
+    for (const [field, maxLength] of [['neighborhood', 80], ['clan', 60], ['dialect', 60]] as const) {
       const normalized = parseLocalIdentifier(payload[field], `payload.${field}`, { maxLength });
       if (normalized) payload[field] = normalized;
       else delete payload[field];
@@ -2454,6 +2467,12 @@ app.post('/v3/contributions/words', async (request, reply) => {
   // Lahja tanlovi darhol tekshiriladi: ilova ro'yxatni serverdan oladi,
   // shuning uchun noto'g'ri qiymat mijoz nuqsoni bo'ladi va uni
   // tasdiqlash vaqtiga qoldirish foydalanuvchidan tanlovni yashirardi.
+  if (asString(payload.dialectId) && asString(payload.dialect)) {
+    return apiError(reply, 422, 'validation_failed', 'Ro‘yxatdagi lahja va erkin matnli lahjani bir vaqtda yuborib bo‘lmaydi.', {
+      'payload.dialectId': ['Bittasini tanlang.'],
+      'payload.dialect': ['Bittasini tanlang.'],
+    });
+  }
   const requestedDialectId = asString(payload.dialectId);
   if (requestedDialectId) {
     if (!isUuid(requestedDialectId)) {
