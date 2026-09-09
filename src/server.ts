@@ -108,6 +108,7 @@ import {
   type ContributionFieldRules,
 } from '@xorazm/shared';
 import { decideAdminAccess } from './admin-access';
+import { createRegionFromProposal, RegionCodeExhaustedError } from './region-catalog';
 import { submitterDisplayName } from './guest-identity';
 import { blockedMessage, decideContributionAccess } from './contribution-access';
 import { buildWordListFilters, WordFilterValidationError } from './word-filters';
@@ -169,6 +170,9 @@ function apiError(reply: FastifyReply, status: number, code: string, message: st
  */
 function failFromError(reply: FastifyReply, error: unknown, context: string): FastifyReply {
   if (error instanceof RouteFault) return apiError(reply, error.status, error.code, error.message);
+  // Nomdan hosil qilingan kodlarning hammasi band. Bu server nuqsoni
+  // emas — moderator nomni biroz o'zgartirsa hal bo'ladi.
+  if (error instanceof RegionCodeExhaustedError) return apiError(reply, 409, 'conflict', error.message);
 
   const translated = translateDatabaseError(error);
   if (translated) {
@@ -524,46 +528,6 @@ async function primaryAudioFor(wordId: string): Promise<{ id: string; playbackUr
   }
 }
 async function activeFences() { const result = await db.query('SELECT * FROM geofences WHERE is_active = true'); return result.rows.map(mapFence); }
-
-/**
- * Tasdiqlangan taklifni rasmiy katalogga yozadi.
- *
- * NEGA OCHIQ (`is_contribution_allowed = true`): loyiha egasi bu nomni
- * ATAYLAB qabul qildi, va talab aynan shu — tasdiqdan keyin nom
- * tanlovlar ro'yxatida paydo bo'lsin. Ilova ro'yxatlari yopiq
- * hududlarni ko'rsatmaydi, shuning uchun yopiq yaratilsa nom hech
- * qachon ko'rinmasdi.
- *
- * Qo'lda yaratish yo'li (`POST /admin/regions`) o'z ehtiyotkor sukutini
- * saqlaydi — u boshqa maqsad uchun: katalogni oldindan tayyorlash.
- *
- * Kod nomdan hosil bo'ladi; to'qnashsa raqam qo'shiladi, chunki kod
- * unikal bo'lishi shart.
- */
-async function createRegionFromProposal(
-  client: PoolClient,
-  proposal: { nameUz: string; level: string; parentRegionId: string | null },
-  moderatorId: string,
-): Promise<string> {
-  const base = regionCodeFromName(proposal.nameUz);
-  for (let attempt = 0; attempt < 20; attempt += 1) {
-    const code = attempt === 0 ? base : `${base}-${attempt + 1}`;
-    try {
-      const created = await client.query<{ id: string }>(
-        `INSERT INTO regions (code, name_uz, parent_id, level, is_contribution_allowed, sort_order, created_by, updated_by)
-         VALUES ($1, $2, $3::uuid, $4::region_level, true,
-                 COALESCE((SELECT max(sort_order) + 1 FROM regions), 1), $5::uuid, $5::uuid)
-         RETURNING id`,
-        [code, proposal.nameUz, proposal.parentRegionId, proposal.level, moderatorId],
-      );
-      return String(created.rows[0]!.id);
-    } catch (error) {
-      // 23505 — kod band. Faqat shu holatda qayta urinamiz.
-      if ((error as { code?: string }).code !== '23505') throw error;
-    }
-  }
-  throw new RouteFault(409, 'conflict', 'Hudud kodi band — nomni biroz o‘zgartirib qayta urinib ko‘ring.');
-}
 
 async function payloadForPublication(source: Json, overrides: Json, client: PoolClient, moderatorId: string): Promise<{ payload: Json; regionResolution: Json | null; dialectResolution: Json | null }> {
   const payload = { ...source, ...overrides };
