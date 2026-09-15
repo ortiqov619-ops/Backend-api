@@ -66,3 +66,15 @@ test('audio serverda tekshirilmaydi — u keyingi so‘rovda keladi', () => {
   assert.equal(SERVER_ENFORCED_CONTRIBUTION_FIELDS.includes('audio' as never), false);
   assert.deepEqual([...SERVER_ENFORCED_CONTRIBUTION_FIELDS].sort(), ['clan', 'dialectId']);
 });
+
+test('majburiy sheva ro‘yxatdan tanlanmay, nomi yozilganda ham to‘ldirilgan hisoblanadi', () => {
+  // Regressiya: «Boshqa sheva…» tanlab nomini yozgan odam yuborish
+  // tugmasini yoqa olmasdi — qoida faqat `dialectId` ni ko'rardi.
+  const rules = { ...DEFAULT_CONTRIBUTION_FIELD_RULES, dialectId: true };
+  assert.deepEqual(missingRequiredContributionFields(rules, { dialect: 'Qipchoq' }, { hasAudio: true }), []);
+  assert.deepEqual(missingRequiredContributionFields(rules, { dialectId: 'uuid-1' }, { hasAudio: true }), []);
+  // Hech biri bo'lmasa — hamon majburiy.
+  assert.deepEqual(missingRequiredContributionFields(rules, {}, { hasAudio: true }), ['dialectId']);
+  // Faqat bo'shliq — to'ldirilmagan.
+  assert.deepEqual(missingRequiredContributionFields(rules, { dialect: '   ' }, { hasAudio: true }), ['dialectId']);
+});

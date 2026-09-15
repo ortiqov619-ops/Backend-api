@@ -2254,6 +2254,7 @@ app.post('/v3/contributions/words', async (request, reply) => {
   const missingFields = missingRequiredContributionFields(fieldRules, {
     clan: asString(payload.clan),
     dialectId: asString(payload.dialectId),
+    dialect: asString(payload.dialect),
   }, { hasAudio: true });
   if (missingFields.length) {
     return apiError(

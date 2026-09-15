@@ -81,12 +81,16 @@ export function parseContributionFieldRules(input: unknown): ContributionFieldRu
  */
 export function missingRequiredContributionFields(
   rules: ContributionFieldRules,
-  payload: Pick<ContributionPayload, 'clan' | 'dialectId'>,
+  payload: Pick<ContributionPayload, 'clan' | 'dialectId' | 'dialect'>,
   options: { hasAudio?: boolean } = {},
 ): ContributionRuleField[] {
   const filled: Record<ContributionRuleField, boolean> = {
     clan: Boolean(payload.clan?.trim()),
-    dialectId: Boolean(payload.dialectId?.trim()),
+    // Sheva ikki yo'l bilan to'ldiriladi: ro'yxatdan tanlash (`dialectId`)
+    // yoki «Boshqa sheva…» orqali nomini yozish (`dialect`). Ilgari faqat
+    // birinchisi hisoblanardi, shuning uchun sheva majburiy bo'lganda
+    // nomini yozgan odam yuborish tugmasini hech qachon yoqa olmasdi.
+    dialectId: Boolean(payload.dialectId?.trim() || payload.dialect?.trim()),
     audio: Boolean(options.hasAudio),
   };
   return CONTRIBUTION_RULE_FIELDS.filter((field) => rules[field] && !filled[field]);
