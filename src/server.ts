@@ -108,7 +108,7 @@ import {
   type ContributionFieldRules,
 } from '@xorazm/shared';
 import { decideAdminAccess } from './admin-access';
-import { createRegionFromProposal, RegionCodeExhaustedError } from './region-catalog';
+import { createRegionChain, RegionCodeExhaustedError } from './region-catalog';
 import { isAboveRegionProposal } from '@xorazm/shared';
 import { submitterDisplayName } from './guest-identity';
 import { blockedMessage, decideContributionAccess } from './contribution-access';
@@ -533,7 +533,9 @@ async function activeFences() { const result = await db.query('SELECT * FROM geo
 async function payloadForPublication(source: Json, overrides: Json, client: PoolClient, moderatorId: string): Promise<{ payload: Json; regionResolution: Json | null; dialectResolution: Json | null }> {
   const payload = { ...source, ...overrides };
   const sourceProposal = source.proposedRegion;
-  const regionId = asString(payload.regionId) || '00000000-0000-4000-8000-000000000001';
+  // `let`: tasdiqlangan taklif yangi viloyat yaratsa, so'z o'sha yerga
+  // ko'chadi va quyidagi nasl tekshiruvi yangi viloyat bo'yicha ketadi.
+  let regionId = asString(payload.regionId) || '00000000-0000-4000-8000-000000000001';
   if (!isUuid(regionId)) throw new RouteFault(422, 'validation_failed', 'So‘z hududi noto‘g‘ri.');
   const region = await client.query('SELECT id, level, is_contribution_allowed FROM regions WHERE id=$1', [regionId]);
   if (!region.rows[0] || region.rows[0].level !== 'region' || !region.rows[0].is_contribution_allowed) {
@@ -557,18 +559,35 @@ async function payloadForPublication(source: Json, overrides: Json, client: Pool
   const acceptProposal = bool(overrides.acceptProposedRegion);
 
   if (proposal && isAboveRegionProposal(proposal.level)) {
-    // Davlat va viloyat taklifi so'zning hududini o'zgartirmaydi — so'z allaqachon
-    // tanlangan viloyatda nashr qilinadi va davlatning ostida hali
-    // birorta viloyat yo'q.
-    const createdAboveId = acceptProposal
-      ? await createRegionFromProposal(client, proposal, moderatorId)
-      : null;
+    // Davlat yoki viloyat taklifi. Tasdiqlanmasa so'z foydalanuvchi
+    // yuborgan viloyatda qoladi.
+    //
+    // Tasdiqlansa taklif va uning ostida yozilgan quyi bo'g'inlar
+    // birga katalogga tushadi. Agar ular orasida viloyat bo'lsa, so'z
+    // o'sha yangi viloyatga (va yozilgan tuman/qishloq/mahallaga)
+    // ko'chiriladi — foydalanuvchiga ko'rsatilgan «moderator qo'shgach
+    // uni ko'chiradi» va'dasi aynan shu.
+    const chain = acceptProposal ? await createRegionChain(client, proposal, moderatorId) : [];
+    const createdId = (level: string) => chain.find((entry) => entry.level === level)?.id;
+    const createdProvinceId = createdId('region');
+    if (createdProvinceId) {
+      regionId = createdProvinceId;
+      payload.regionId = createdProvinceId;
+      // Eski viloyatning tuman va qishloqlari yangi viloyatga tegishli
+      // emas, shuning uchun ular faqat yaratilganlari bilan almashadi.
+      payload.districtId = createdId('district');
+      payload.villageId = createdId('village');
+      payload.neighborhoodId = createdId('neighborhood');
+      payload.neighborhood = undefined;
+    }
     regionResolution = {
-      resolution: 'generalized',
+      resolution: createdProvinceId ? 'canonical' : 'generalized',
       proposedNameUz: proposal.nameUz,
       proposedLevel: proposal.level,
       matchedRegionId: null,
-      createdRegionId: createdAboveId,
+      createdRegionId: chain[0]?.id ?? null,
+      createdRegions: chain as unknown as Json,
+      publishedRegionId: regionId,
       publishedDistrictId: asString(payload.districtId) || null,
       publishedVillageId: asString(payload.villageId) || null,
       publishedNeighborhoodId: asString(payload.neighborhoodId) || null,
@@ -609,7 +628,8 @@ async function payloadForPublication(source: Json, overrides: Json, client: Pool
     // eski xulq saqlanadi: faqat moderator tanlagan mavjud hudud
     // ishlatiladi.
     if (acceptProposal) {
-      const createdId = await createRegionFromProposal(client, proposal, moderatorId);
+      const chain = await createRegionChain(client, proposal, moderatorId);
+      const createdId = chain[0]!.id;
       const field = proposal.level === 'district' ? 'districtId'
         : proposal.level === 'village' ? 'villageId'
         : 'neighborhoodId';
@@ -627,6 +647,17 @@ async function payloadForPublication(source: Json, overrides: Json, client: Pool
         }
       }
       payload[field] = createdId;
+      // Taklif ostidagi darajalar faqat yaratilganlari bilan to'ldiriladi.
+      // Yangi hudud ostida mavjud katalog yozuvi bo'lishi mumkin emas,
+      // shuning uchun avvalgi tanlov qolib ketsa nasl tekshiruvi so'zni
+      // rad etardi.
+      const below = (level: string) => chain.find((entry) => entry.level === level)?.id;
+      if (proposal.level === 'district') {
+        payload.villageId = below('village');
+        payload.neighborhoodId = below('neighborhood');
+      } else if (proposal.level === 'village') {
+        payload.neighborhoodId = below('neighborhood');
+      }
       // Erkin matnli mahalla nomi endi keraksiz: u katalog yozuviga aylandi.
       payload.neighborhood = undefined;
       delete payload.proposedRegion;
@@ -636,6 +667,7 @@ async function payloadForPublication(source: Json, overrides: Json, client: Pool
         proposedLevel: proposal.level,
         matchedRegionId: createdId,
         createdRegionId: createdId,
+        createdRegions: chain as unknown as Json,
         publishedDistrictId: asString(payload.districtId) || null,
         publishedVillageId: asString(payload.villageId) || null,
         publishedNeighborhoodId: asString(payload.neighborhoodId) || null,

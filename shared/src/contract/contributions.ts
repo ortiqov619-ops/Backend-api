@@ -24,6 +24,58 @@ export interface ProposedRegion {
    */
   level: 'republic' | 'region' | 'district' | 'village' | 'neighborhood';
   parentRegionId?: Uuid;
+  /**
+   * Taklif qilingan hudud OSTIDAGI, katalogda yo'q quyi bo'g'inlar.
+   *
+   * Foydalanuvchi «Boshqa davlat» tanlasa, uning viloyati, tumani,
+   * qishlog'i va mahallasi ham katalogda bo'lishi mumkin emas — ular
+   * yangi davlatning ichida. Ularni tanlab bo'lmaydi, lekin yozib
+   * aytish mumkin va kerak. Ilgari bu darajalar umuman so'ralmasdi.
+   *
+   * Tartib yuqoridan pastga. Har bir bo'g'inning ota-hududi — ro'yxatda
+   * undan oldingisi (birinchisiniki esa taklifning o'zi). Qishloq
+   * tushib qolishi mumkin: mahalla to'g'ridan-to'g'ri tuman ostida ham
+   * bo'ladi.
+   */
+  lowerLevels?: ProposedLowerLevel[];
+}
+
+export interface ProposedLowerLevel {
+  level: 'region' | 'district' | 'village' | 'neighborhood';
+  nameUz: string;
+}
+
+/** Har bir taklif darajasining ostida qaysi darajalar so'raladi. */
+export const REGION_LEVELS_BELOW: Record<ProposedRegion['level'], ProposedLowerLevel['level'][]> = {
+  republic: ['region', 'district', 'village', 'neighborhood'],
+  region: ['district', 'village', 'neighborhood'],
+  district: ['village', 'neighborhood'],
+  village: ['neighborhood'],
+  neighborhood: [],
+};
+
+/**
+ * `child` darajasi `parent` darajasining bevosita ostida tura oladimi.
+ *
+ * Katalogdagi qoida bilan bir xil: mahalla qishloq ostida ham, tuman
+ * ostida ham bo'ladi, qolgan darajalar esa faqat bitta pog'ona pastda.
+ */
+export function regionLevelFitsUnder(child: ProposedRegion['level'], parent: ProposedRegion['level']): boolean {
+  if (child === 'region') return parent === 'republic';
+  if (child === 'district') return parent === 'region';
+  if (child === 'village') return parent === 'district';
+  if (child === 'neighborhood') return parent === 'district' || parent === 'village';
+  return false;
+}
+
+/** Quyi bo'g'inlar zanjiri taklif darajasidan boshlab uzilmay davom etadimi. */
+export function isValidRegionChain(top: ProposedRegion['level'], lower: readonly ProposedLowerLevel[]): boolean {
+  let parent = top;
+  for (const entry of lower) {
+    if (!regionLevelFitsUnder(entry.level, parent)) return false;
+    parent = entry.level;
+  }
+  return true;
 }
 
 /**

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { Pool, type PoolClient } from 'pg';
 import {
+  createRegionChain,
   createRegionFromProposal,
   RegionCodeExhaustedError,
   REGION_CODE_ATTEMPTS,
@@ -129,4 +130,42 @@ test('haqiqiy bazada davlat ota-hududsiz yaratiladi', needsDatabase, async () =>
     assert.equal(row.rows[0]!.level, 'republic');
     assert.equal(row.rows[0]!.parent_id, null);
   });
+});
+
+// ---------------------------------------------------------------------------
+// Zanjir
+// ---------------------------------------------------------------------------
+
+test('zanjirdagi har bir bo‘g‘in oldingisining ostiga yoziladi', async () => {
+  const inserts: { code: string; level: unknown; parent: unknown }[] = [];
+  const db: QueryExecutor = {
+    async query(_text: string, values?: unknown[]) {
+      const code = String(values?.[0]);
+      inserts.push({ code, level: values?.[3], parent: values?.[2] });
+      return { rows: [{ id: `id-${code}` }], rowCount: 1 };
+    },
+  };
+  const chain = await createRegionChain(db, {
+    nameUz: 'Turkmaniston', level: 'republic', parentRegionId: null,
+    lowerLevels: [
+      { level: 'region', nameUz: 'Lebap' },
+      { level: 'district', nameUz: 'Chorjoy' },
+      { level: 'neighborhood', nameUz: 'Guliston' },
+    ],
+  }, 'mod-1');
+
+  assert.deepEqual(chain, [
+    { level: 'republic', id: 'id-turkmaniston' },
+    { level: 'region', id: 'id-lebap' },
+    { level: 'district', id: 'id-chorjoy' },
+    { level: 'neighborhood', id: 'id-guliston' },
+  ]);
+  // Ota-hudud — har doim oldingi yaratilgani; davlatniki esa yo'q.
+  assert.deepEqual(inserts.map((row) => row.parent), [null, 'id-turkmaniston', 'id-lebap', 'id-chorjoy']);
+});
+
+test('quyi bo‘g‘insiz zanjir faqat taklifning o‘zini yaratadi', async () => {
+  const db = fakeExecutor(new Set());
+  const chain = await createRegionChain(db, { nameUz: 'Pitnak', level: 'district', parentRegionId: XORAZM_ID }, 'mod-1');
+  assert.deepEqual(chain, [{ level: 'district', id: 'id-for-pitnak' }]);
 });

@@ -1,3 +1,5 @@
+import { isValidRegionChain, REGION_LEVELS_BELOW, type ProposedLowerLevel } from '@xorazm/shared';
+
 /**
  * Foydalanuvchi taklif qila oladigan hudud darajalari.
  *
@@ -15,7 +17,16 @@ export interface NormalizedRegionSuggestion {
   level: ProposedRegionLevel;
   /** Davlat taklifida `null`: davlatning ota-hududi bo'lmaydi. */
   parentRegionId: string | null;
+  /**
+   * Taklif ostidagi, katalogda yo'q quyi bo'g'inlar — yuqoridan pastga.
+   * Bo'sh bo'lsa kalit umuman qo'yilmaydi: eski yozuvlar va eski
+   * mijozlar bilan bir xil ko'rinishda qoladi.
+   */
+  lowerLevels?: ProposedLowerLevel[];
 }
+
+/** Bitta taklifda bo'lishi mumkin bo'lgan eng ko'p quyi bo'g'in. */
+export const MAX_LOWER_LEVELS = 4;
 
 export interface RegionPublicationResolution {
   districtId: string | null;
@@ -57,6 +68,56 @@ export function normalizeRegionName(value: string): string {
 }
 
 /**
+ * Foydalanuvchi yozgan hudud nomi.
+ *
+ * Taklifning o'zi ham, uning ostidagi quyi bo'g'inlar ham bir xil
+ * qat'iylikda tekshiriladi: ularning hammasi moderator ekraniga va
+ * tasdiqlansa katalogga tushadi.
+ */
+function normalizeProposedName(input: unknown, field: string): string {
+  const rawName = typeof input === 'string' ? input : '';
+  const nameUz = rawName.normalize('NFKC').replace(/\s+/g, ' ').trim();
+  if (nameUz.length < 2 || nameUz.length > 80) {
+    throw new RegionSuggestionValidationError('Hudud nomi 2–80 ta belgidan iborat bo‘lishi kerak.', field);
+  }
+  if (!SAFE_REGION_NAME.test(nameUz) || /https?:|www\.|@/iu.test(nameUz)) {
+    throw new RegionSuggestionValidationError('Hudud nomida ruxsat etilmagan belgi bor.', field);
+  }
+  if (['boshqa', 'other', 'hudud'].includes(normalizeRegionName(nameUz))) {
+    throw new RegionSuggestionValidationError('Hududning aniq nomini kiriting.', field);
+  }
+  return nameUz;
+}
+
+/**
+ * Quyi bo'g'inlar ro'yxati.
+ *
+ * Zanjir uzilmasligi shart: tuman viloyatsiz, qishloq tumansiz kela
+ * olmaydi — aks holda tasdiqlanganda katalogga ota-hududi yo'q yozuv
+ * tushardi. Yo'q yoki bo'sh ro'yxat xato emas.
+ */
+function parseLowerLevels(input: unknown, top: ProposedRegionLevel): ProposedLowerLevel[] {
+  if (input == null) return [];
+  if (!Array.isArray(input) || input.length > MAX_LOWER_LEVELS) {
+    throw new RegionSuggestionValidationError('Quyi hududlar ro‘yxati noto‘g‘ri.', 'payload.proposedRegion.lowerLevels');
+  }
+  const allowed = REGION_LEVELS_BELOW[top];
+  const entries = input.map((raw, index) => {
+    const entry = asRecord(raw);
+    const field = `payload.proposedRegion.lowerLevels.${index}`;
+    const level = typeof entry?.level === 'string' ? entry.level : '';
+    if (!allowed.includes(level as ProposedLowerLevel['level'])) {
+      throw new RegionSuggestionValidationError('Quyi hudud turi noto‘g‘ri.', `${field}.level`);
+    }
+    return { level: level as ProposedLowerLevel['level'], nameUz: normalizeProposedName(entry?.nameUz, `${field}.nameUz`) };
+  });
+  if (!isValidRegionChain(top, entries)) {
+    throw new RegionSuggestionValidationError('Quyi hududlar tartibi noto‘g‘ri: avval yuqori hududni yozing.', 'payload.proposedRegion.lowerLevels');
+  }
+  return entries;
+}
+
+/**
  * Mobil ilovadan kelgan "Boshqa hudud" qiymatini qat'iy allow-list bo‘yicha
  * normallashtiradi. Bu qiymat rasmiy `regions` jadvaliga avtomatik yozilmaydi;
  * u so‘z taklifi bilan birga moderator ko‘rishi uchun saqlanadi.
@@ -69,17 +130,7 @@ export function parseRegionSuggestion(
   const value = asRecord(input);
   if (!value) throw new RegionSuggestionValidationError('Boshqa hudud ma’lumoti noto‘g‘ri.', 'payload.proposedRegion');
 
-  const rawName = typeof value.nameUz === 'string' ? value.nameUz : '';
-  const nameUz = rawName.normalize('NFKC').replace(/\s+/g, ' ').trim();
-  if (nameUz.length < 2 || nameUz.length > 80) {
-    throw new RegionSuggestionValidationError('Hudud nomi 2–80 ta belgidan iborat bo‘lishi kerak.', 'payload.proposedRegion.nameUz');
-  }
-  if (!SAFE_REGION_NAME.test(nameUz) || /https?:|www\.|@/iu.test(nameUz)) {
-    throw new RegionSuggestionValidationError('Hudud nomida ruxsat etilmagan belgi bor.', 'payload.proposedRegion.nameUz');
-  }
-  if (['boshqa', 'other', 'hudud'].includes(normalizeRegionName(nameUz))) {
-    throw new RegionSuggestionValidationError('Hududning aniq nomini kiriting.', 'payload.proposedRegion.nameUz');
-  }
+  const nameUz = normalizeProposedName(value.nameUz, 'payload.proposedRegion.nameUz');
 
   const rawLevel = typeof value.level === 'string' ? value.level : 'district';
   if (!PROPOSED_REGION_LEVELS.includes(rawLevel as ProposedRegionLevel)) {
@@ -87,12 +138,14 @@ export function parseRegionSuggestion(
   }
 
   const level = rawLevel as ProposedRegionLevel;
+  const lowerLevels = parseLowerLevels(value.lowerLevels, level);
+  const withLower = lowerLevels.length ? { lowerLevels } : {};
 
   // Davlat ierarxiyaning tepasida turadi: unga ota-hudud berib
   // bo'lmaydi, aks holda davlat o'zidan kichik hududning ichiga tushib
   // qolardi. Mijoz yuborgan qiymat e'tiborga olinmaydi.
   if (level === 'republic') {
-    return { nameUz, level, parentRegionId: null };
+    return { nameUz, level, parentRegionId: null, ...withLower };
   }
   // Viloyatning ustida davlat turadi va u tanlangan bo'lishi kerak.
   // Berilmasa `fallbackParentRegionId` ishlatilmaydi: u viloyat, ya'ni
@@ -102,7 +155,7 @@ export function parseRegionSuggestion(
     if (!UUID_PATTERN.test(countryId)) {
       throw new RegionSuggestionValidationError('Yangi viloyat uchun davlatni tanlang.', 'payload.proposedRegion.parentRegionId');
     }
-    return { nameUz, level, parentRegionId: countryId };
+    return { nameUz, level, parentRegionId: countryId, ...withLower };
   }
 
   const parentRegionId = typeof value.parentRegionId === 'string' && value.parentRegionId.trim()
@@ -112,7 +165,7 @@ export function parseRegionSuggestion(
     throw new RegionSuggestionValidationError('Hududning yuqori bo‘g‘ini noto‘g‘ri.', 'payload.proposedRegion.parentRegionId');
   }
 
-  return { nameUz, level, parentRegionId };
+  return { nameUz, level, parentRegionId, ...withLower };
 }
 
 /**

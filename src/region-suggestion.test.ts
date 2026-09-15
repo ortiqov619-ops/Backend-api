@@ -14,6 +14,7 @@ import {
   uniqueDialectIdByLabel,
   RegionSuggestionValidationError,
 } from './region-suggestion';
+import { regionLevelFitsUnder } from '@xorazm/shared';
 
 const XORAZM_ID = '00000000-0000-4000-8000-000000000001';
 
@@ -269,4 +270,106 @@ test('viloyat taklifi so‘zni hech qanday tumanga bog‘lamaydi', () => {
   );
   assert.equal(resolved.matchedRegionId, null);
   assert.equal(resolved.resolution, 'generalized');
+});
+
+// ---------------------------------------------------------------------------
+// Quyi bo'g'inlar zanjiri
+// ---------------------------------------------------------------------------
+
+test('davlat taklifi viloyat, tuman, qishloq va mahallani olib keladi', () => {
+  // Ilgari «Boshqa davlat» tanlanganda bular umuman so'ralmasdi.
+  assert.deepEqual(
+    parseRegionSuggestion({
+      nameUz: 'Turkmaniston',
+      level: 'republic',
+      lowerLevels: [
+        { level: 'region', nameUz: ' Lebap  viloyati ' },
+        { level: 'district', nameUz: 'Chorjo‘y' },
+        { level: 'village', nameUz: 'Yangi ovul' },
+        { level: 'neighborhood', nameUz: 'Guliston' },
+      ],
+    }, XORAZM_ID),
+    {
+      nameUz: 'Turkmaniston',
+      level: 'republic',
+      parentRegionId: null,
+      lowerLevels: [
+        { level: 'region', nameUz: 'Lebap viloyati' },
+        { level: 'district', nameUz: 'Chorjo‘y' },
+        { level: 'village', nameUz: 'Yangi ovul' },
+        { level: 'neighborhood', nameUz: 'Guliston' },
+      ],
+    },
+  );
+});
+
+test('qishloq tushib qolishi mumkin — mahalla tuman ostida ham bo‘ladi', () => {
+  const parsed = parseRegionSuggestion({
+    nameUz: 'Yangi tuman', level: 'district',
+    lowerLevels: [{ level: 'neighborhood', nameUz: 'Guliston' }],
+  }, XORAZM_ID);
+  assert.deepEqual(parsed?.lowerLevels, [{ level: 'neighborhood', nameUz: 'Guliston' }]);
+});
+
+test('uzilgan zanjir rad etiladi', () => {
+  // Viloyatsiz tuman katalogga ota-hududi yo'q holda tushardi.
+  for (const lowerLevels of [
+    [{ level: 'district', nameUz: 'Chorjo‘y' }],
+    [{ level: 'region', nameUz: 'Lebap' }, { level: 'village', nameUz: 'Ovul' }],
+    [{ level: 'region', nameUz: 'Lebap' }, { level: 'region', nameUz: 'Mari' }],
+  ]) {
+    assert.throws(
+      () => parseRegionSuggestion({ nameUz: 'Turkmaniston', level: 'republic', lowerLevels }, XORAZM_ID),
+      RegionSuggestionValidationError,
+      JSON.stringify(lowerLevels),
+    );
+  }
+});
+
+test('taklif darajasidan yuqori yoki teng quyi bo‘g‘in rad etiladi', () => {
+  assert.throws(
+    () => parseRegionSuggestion({ nameUz: 'Ovul', level: 'village', lowerLevels: [{ level: 'district', nameUz: 'Tuman' }] }, XORAZM_ID),
+    RegionSuggestionValidationError,
+  );
+  assert.throws(
+    () => parseRegionSuggestion({ nameUz: 'Guliston', level: 'neighborhood', lowerLevels: [{ level: 'neighborhood', nameUz: 'Bog‘' }] }, XORAZM_ID),
+    RegionSuggestionValidationError,
+  );
+});
+
+test('quyi bo‘g‘in nomi ham xavfsizlik tekshiruvidan o‘tadi', () => {
+  for (const nameUz of ['T', 'boshqa', 'http://x.test', 'x'.repeat(81)]) {
+    assert.throws(
+      () => parseRegionSuggestion({ nameUz: 'Turkmaniston', level: 'republic', lowerLevels: [{ level: 'region', nameUz }] }, XORAZM_ID),
+      RegionSuggestionValidationError,
+      nameUz,
+    );
+  }
+});
+
+test('juda uzun yoki massiv bo‘lmagan ro‘yxat rad etiladi', () => {
+  const tooMany = Array.from({ length: 5 }, () => ({ level: 'region', nameUz: 'Lebap' }));
+  for (const lowerLevels of [tooMany, 'Lebap', { level: 'region', nameUz: 'Lebap' }]) {
+    assert.throws(
+      () => parseRegionSuggestion({ nameUz: 'Turkmaniston', level: 'republic', lowerLevels }, XORAZM_ID),
+      RegionSuggestionValidationError,
+    );
+  }
+});
+
+test('quyi bo‘g‘in bo‘lmasa natija eski ko‘rinishda qoladi', () => {
+  // Saqlangan eski takliflar va eski ilova versiyalari o'zgarmasligi kerak.
+  const parsed = parseRegionSuggestion({ nameUz: 'Yangi tuman', level: 'district', lowerLevels: [] }, XORAZM_ID);
+  assert.equal(Object.prototype.hasOwnProperty.call(parsed, 'lowerLevels'), false);
+});
+
+test('umumiy zanjir qoidasi katalog qoidasi bilan bir xil', () => {
+  // Ikkita joyda yozilgan bir qoida vaqt o'tib ajralib ketmasligi uchun.
+  const levels = ['republic', 'region', 'district', 'village', 'neighborhood'] as const;
+  for (const child of levels) {
+    for (const parent of levels) {
+      const catalog = child === 'republic' ? false : canCreateRegionUnder(child, parent);
+      assert.equal(regionLevelFitsUnder(child, parent), catalog, `${child} ← ${parent}`);
+    }
+  }
 });

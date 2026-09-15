@@ -66,3 +66,37 @@ export async function createRegionFromProposal(
   }
   throw new RegionCodeExhaustedError();
 }
+
+export interface CreatedRegion {
+  level: string;
+  id: string;
+}
+
+/**
+ * Taklifni va uning ostidagi quyi bo'g'inlarni birga yaratadi.
+ *
+ * Har bir bo'g'in o'zidan oldingisining ostiga yoziladi, shuning uchun
+ * «Turkmaniston › Lebap › Chorjo'y» bir qarorda to'liq ierarxiya bo'lib
+ * tushadi. Zanjir to'g'riligini `parseRegionSuggestion` allaqachon
+ * tekshirgan — bu yerda faqat yoziladi.
+ *
+ * Qaytgan ro'yxat yuqoridan pastga, birinchisi — taklifning o'zi.
+ */
+export async function createRegionChain(
+  executor: QueryExecutor,
+  proposal: RegionProposal & { lowerLevels?: readonly { level: string; nameUz: string }[] },
+  moderatorId: string,
+): Promise<CreatedRegion[]> {
+  const created: CreatedRegion[] = [];
+  let parentId = await createRegionFromProposal(executor, proposal, moderatorId);
+  created.push({ level: proposal.level, id: parentId });
+  for (const entry of proposal.lowerLevels ?? []) {
+    parentId = await createRegionFromProposal(
+      executor,
+      { nameUz: entry.nameUz, level: entry.level, parentRegionId: parentId },
+      moderatorId,
+    );
+    created.push({ level: entry.level, id: parentId });
+  }
+  return created;
+}
