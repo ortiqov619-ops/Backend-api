@@ -167,9 +167,19 @@ export class XorazmApiClient {
     });
   }
 
-  /** Foydalanuvchining o'z takliflari va ular bo'yicha moderator qarori. */
-  myContributions(query?: MyContributionListQuery): Promise<MyContributionListResponse> {
-    return this.http.request('GET', '/app/contributions', { query: toQuery(query) });
+  /**
+   * Foydalanuvchining o'z takliflari va ular bo'yicha moderator qarori.
+   *
+   * `installationId` — mehmon uchun: hisobsiz odam ham o'z qurilmasidan
+   * yuborgan so'zlar tasdiqlangan yoki rad etilganini ko'rishi kerak.
+   * Sarlavhada ketadi, manzilda emas: qurilma belgisi server loglarida
+   * URL bo'lib qolmasligi kerak.
+   */
+  myContributions(query?: MyContributionListQuery, installationId?: string): Promise<MyContributionListResponse> {
+    return this.http.request('GET', '/app/contributions', {
+      query: toQuery(query),
+      headers: installationId ? { 'X-Installation-Id': installationId } : undefined,
+    });
   }
 
   /* ----------------------------- community --------------------------- */

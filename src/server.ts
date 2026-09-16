@@ -76,6 +76,7 @@ import {
   UPDATE_REQUEST_RESOLUTION,
   UPSERT_APP_CONTENT,
 } from './sql';
+import { myContributionsScope } from './my-contributions-scope';
 import { iso, requiredIso } from './timestamps';
 import {
   APP_TYPES,
@@ -1883,12 +1884,30 @@ app.get('/v3/app/saved-words', async (request, reply) => {
  * foydalanuvchi so'z yuborgach uning taqdirini ko'ra olmasdi.
  */
 app.get('/v3/app/contributions', async (request, reply) => {
-  const user = await requireAppUser(request, reply);
-  if (!user) return;
+  /**
+   * Mehmon ham o'z takliflarini ko'radi.
+   *
+   * Hisobsiz yuborilgan so'z bo'yicha qaror (ayniqsa rad etish) egasiga
+   * hech qanday yo'l bilan yetmasdi: bildirishnoma hisobga yoziladi,
+   * mehmonda esa hisob yo'q. Endi u qurilmasidan yuborgan takliflarini
+   * holati va moderator izohi bilan shu yerda ko'radi.
+   *
+   * Token bo'lsa eski xulq o'zgarmaydi — yaroqsiz token baribir `401`
+   * beradi, aks holda muddati tugagan hisob jimgina mehmonga aylanib
+   * qolardi.
+   */
+  const installationHeader = request.headers['x-installation-id'];
+  const installationId = asString(Array.isArray(installationHeader) ? installationHeader[0] : installationHeader);
+  if (installationId.length > 160) return apiError(reply, 422, 'validation_failed', 'Qurilma identifikatori juda uzun.');
+  const hasBearer = Boolean(request.headers.authorization?.startsWith('Bearer '));
+  const user = hasBearer || !installationId ? await requireAppUser(request, reply) : null;
+  if (hasBearer && !user) return;
+  if (!user && !installationId) return;
+  const scope = myContributionsScope({ userId: user ? String(user.id) : null, installationId });
   const query = request.query as Json;
   const current = page(query.page);
   const size = pageSize(query.pageSize);
-  const params: unknown[] = [user.id];
+  const params: unknown[] = [...scope.params];
   let statusClause = '';
   const status = asString(query.status);
   if (status) {
@@ -1899,7 +1918,7 @@ app.get('/v3/app/contributions', async (request, reply) => {
     statusClause = ` AND cr.status = $${params.length}::moderation_status`;
   }
   const counted = await db.query<{ total: number }>(
-    `SELECT count(*)::int AS total FROM contribution_requests cr WHERE cr.submitted_by_user_id=$1::uuid${statusClause}`,
+    `SELECT count(*)::int AS total FROM contribution_requests cr WHERE ${scope.clause}${statusClause}`,
     params,
   );
   params.push(size, (current - 1) * size);
@@ -1916,7 +1935,7 @@ app.get('/v3/app/contributions', async (request, reply) => {
           WHERE candidate.contribution_request_id = cr.id AND candidate.superseded_at IS NULL
           ORDER BY candidate.created_at DESC LIMIT 1
        ) a ON true
-      WHERE cr.submitted_by_user_id=$1::uuid${statusClause}
+      WHERE ${scope.clause}${statusClause}
       ORDER BY cr.created_at DESC LIMIT $${params.length - 1} OFFSET $${params.length}`,
     params,
   );

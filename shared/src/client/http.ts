@@ -68,6 +68,8 @@ export interface RequestOptions {
   idempotencyKey?: string;
   /** `false` — Authorization sarlavhasini qo'shmaslik (public endpointlar). */
   auth?: boolean;
+  /** Qo'shimcha sarlavhalar (masalan hisobsiz so'rovdagi qurilma belgisi). */
+  headers?: Record<string, string>;
 }
 
 export interface BackendWarmupOptions {
@@ -195,6 +197,8 @@ export class HttpClient {
       if (token) headers.Authorization = `Bearer ${token}`;
     }
     if (!opts.formData && opts.body !== undefined) headers['Content-Type'] = 'application/json';
+    // So'rovga xos sarlavhalar oxirida qo'yiladi: ular aniqroq.
+    if (opts.headers) Object.assign(headers, opts.headers);
 
     try {
       const response = await fetch(buildUrl(this.options.baseUrl, path, opts.query), {
