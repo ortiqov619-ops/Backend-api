@@ -380,3 +380,64 @@ test('tuman va qishloqdagi so‘z viloyat sanog‘iga ham kiradi', needsDatabase
     assert.equal(Number(after), Number(before) + 1, 'tumandagi so‘z viloyatda ham ko‘rinishi kerak');
   });
 });
+
+// ---------------------------------------------------------------------------
+// `proposedRegion` shakli — 0008 dagi CHECK constraint
+// ---------------------------------------------------------------------------
+
+/**
+ * Nuqson: constraint 0008 da yozilganda taklif qilsa bo'ladigan darajalar
+ * faqat tuman/qishloq/mahalla edi. Keyin server va ilova davlat va viloyat
+ * taklifini ham qo'llab-quvvatlaydigan bo'ldi, constraint esa qolib ketdi —
+ * natijada «Boshqa davlat» yoki «Boshqa viloyat» tanlangan so'z `23514`
+ * bilan yiqilar va moderatsiya navbatiga UMUMAN tushmasdi.
+ *
+ * Bu tekshiruvni sof unit test tuta olmaydi: rad etuvchi constraintning
+ * o'zi faqat bazada bor.
+ */
+async function insertProposal(client: PoolClient, proposedRegion: unknown): Promise<void> {
+  await client.query(
+    `INSERT INTO contribution_requests (payload, idempotency_key, validation_verdict, validation_score, requires_human_review)
+     VALUES (jsonb_build_object('word','gelyatir','meaning','kelayotir','proposedRegion',$2::jsonb),
+             $1, 'needs_manual_review', 55, true)`,
+    [unique('proposal-idem'), JSON.stringify(proposedRegion)],
+  );
+}
+
+const XORAZM_REGION_ID = '00000000-0000-4000-8000-000000000001';
+
+test('davlat va viloyat taklifi ham saqlanadi', needsDatabase, async () => {
+  await inRollback(async (client) => {
+    // Davlat — ierarxiyaning ildizi, ota-hududi yo'q.
+    await insertProposal(client, { nameUz: 'Qozog‘iston', level: 'republic', parentRegionId: null });
+    // Viloyatning ustida davlat turadi.
+    await insertProposal(client, { nameUz: 'Buxoro', level: 'region', parentRegionId: XORAZM_REGION_ID });
+    // Eski darajalar o'zgarishsiz qabul qilinadi.
+    await insertProposal(client, { nameUz: 'Yangi mahalla', level: 'neighborhood', parentRegionId: XORAZM_REGION_ID });
+  });
+});
+
+test('shakli buzilgan taklif hamon rad etiladi', needsDatabase, async () => {
+  await inRollback(async (client) => {
+    for (const broken of [
+      // Ro'yxatda yo'q daraja.
+      { nameUz: 'Nimadir', level: 'planet', parentRegionId: XORAZM_REGION_ID },
+      // Tuman ota-hududsiz qolmasligi kerak.
+      { nameUz: 'Yangi tuman', level: 'district', parentRegionId: null },
+      // UUID o'rniga erkin matn.
+      { nameUz: 'Yangi tuman', level: 'district', parentRegionId: 'xorazm' },
+      // Nom juda qisqa.
+      { nameUz: 'X', level: 'district', parentRegionId: XORAZM_REGION_ID },
+      // Davlatga ota-hudud berib bo'lmaydi.
+      { nameUz: 'Qozog‘iston', level: 'republic', parentRegionId: XORAZM_REGION_ID },
+    ]) {
+      await client.query('SAVEPOINT broken_proposal');
+      await assert.rejects(
+        () => insertProposal(client, broken),
+        (error: { code?: string }) => error.code === '23514',
+        `qabul qilindi: ${JSON.stringify(broken)}`,
+      );
+      await client.query('ROLLBACK TO SAVEPOINT broken_proposal');
+    }
+  });
+});
