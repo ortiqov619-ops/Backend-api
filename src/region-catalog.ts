@@ -42,6 +42,14 @@ export class RegionCodeExhaustedError extends Error {
  * `code` unikal, shuning uchun nomdan hosil qilingan kod band bo'lsa
  * oxiriga raqam qo'shiladi. Faqat `23505` (unique violation) qayta
  * urinishga sabab bo'ladi — qolgan xatolar yuqoriga uzatiladi.
+ *
+ * Har bir urinish SAVEPOINT ichida bajariladi. Bu shart emasdek
+ * ko'rinadi, lekin usiz qayta urinish HAQIQIY bazada hech qachon
+ * ishlamaydi: PostgreSQLda tranzaksiya ichidagi xato butun
+ * tranzaksiyani bekor qiladi va keyingi har qanday buyruq `25P02`
+ * («current transaction is aborted») bilan yiqiladi. Chaqiruvchi esa
+ * moderatsiya qarorini aynan tranzaksiya ichida qabul qiladi, ya'ni
+ * band kod moderatorga 500 bo'lib ko'rinardi.
  */
 export async function createRegionFromProposal(
   executor: QueryExecutor,
@@ -51,6 +59,7 @@ export async function createRegionFromProposal(
   const base = regionCodeFromName(proposal.nameUz);
   for (let attempt = 0; attempt < REGION_CODE_ATTEMPTS; attempt += 1) {
     const code = attempt === 0 ? base : `${base}-${attempt + 1}`;
+    await executor.query('SAVEPOINT region_code_attempt');
     try {
       const created = await executor.query(
         `INSERT INTO regions (code, name_uz, parent_id, level, is_contribution_allowed, sort_order, created_by, updated_by)
@@ -59,8 +68,13 @@ export async function createRegionFromProposal(
          RETURNING id`,
         [code, proposal.nameUz, proposal.parentRegionId, proposal.level, moderatorId],
       );
+      await executor.query('RELEASE SAVEPOINT region_code_attempt');
       return String(created.rows[0]!.id);
     } catch (error) {
+      // Savepointgacha qaytarish tranzaksiyani yana yozishga yaroqli
+      // qiladi. Boshqa xato uzatilsa ham buni qilish kerak: chaqiruvchi
+      // xatoni ushlab, tranzaksiyani o'zi tugatadi.
+      await executor.query('ROLLBACK TO SAVEPOINT region_code_attempt');
       if ((error as { code?: string }).code !== '23505') throw error;
     }
   }
