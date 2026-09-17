@@ -1047,7 +1047,39 @@ async function transcribe(buffer: Buffer, filename: string, mimeType: string): P
   return { text: data.text.trim(), confidence: null, language: data.language ?? 'uz' };
 }
 
-app.get('/health', async (_request, reply) => {
+/**
+ * Liveness — protsessning o'zi javob beryaptimi.
+ *
+ * Bazaga UMUMAN tegmaydi va bu ataylab shunday. Bu yo'lni uchta narsa
+ * chaqiradi va uchalasi ham juda tez-tez:
+ *
+ *   * Render'ning health check'i (`render.yaml`);
+ *   * Cloudflare Worker'ning har 10 daqiqalik croni — u Render'ni
+ *     uxlab qolishdan saqlaydi;
+ *   * ilova ekran ochilganda yuboradigan "uyg'otish" so'rovi
+ *     (`warmBackend`, `packages/shared/src/client/http.ts`).
+ *
+ * Ilgari har bir shunday chaqiruv ikkita SQL so'rov yuborardi va Neon'ni
+ * uyg'otardi. Har 10 daqiqada uyg'otish oyiga ~180 CU-soat degani, bepul
+ * tarifda esa 100 CU-soat bor: limit oy o'rtasida tugab, baza oyning
+ * qolgan qismida to'xtab qolardi.
+ *
+ * Chaqiruvchilarning hech biri javob tanasini o'qimaydi — ular faqat
+ * HTTP holatiga qaraydi — shuning uchun tana eng qisqa ko'rinishda.
+ *
+ * Bazaning holati endi `/health/db` da. U DIQQAT bilan, qo'lda
+ * chaqiriladi: monitoringni yoki cronni unga qaratish yuqoridagi
+ * xarajatni qaytaradi.
+ */
+app.get('/health', async () => ({ status: 'ok' }));
+
+/**
+ * Readiness — baza javob beryaptimi va sxema qaysi migratsiyada.
+ *
+ * Bu so'rov Neon'ni uyg'otadi, shuning uchun uni faqat odam yoki
+ * deploydan keyingi bir martalik tekshiruv chaqirishi kerak.
+ */
+app.get('/health/db', async (_request, reply) => {
   try {
     const [, migrations] = await Promise.all([
       db.query('SELECT 1'),

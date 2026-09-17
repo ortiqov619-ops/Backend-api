@@ -26,7 +26,12 @@ npm run migrate
 npm run seed:admin
 ```
 
-Keyin `https://<render-domen>/health` javobi `database: connected` ko‘rsatadi.
+Keyin `https://<render-domen>/health/db` javobi `database: connected` va eng
+yangi `schemaVersion` ko‘rsatadi. `/health` esa bazaga tegmaydi va faqat
+`{"status":"ok"}` qaytaradi — uni Render, Worker croni va ilova juda tez-tez
+so‘raydi, har chaqiruvda Neon uyg‘otilsa bepul tarifdagi oylik CU-soat oy
+o‘rtasida tugardi. Shu sababli monitoringni ham, cronni ham `/health/db` ga
+qaratmang.
 Mobil va admin ilovalarda API manzili quyidagicha bo‘ladi:
 
 ```text
